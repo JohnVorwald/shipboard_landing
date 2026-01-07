@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ship_motion.ddg_motion import DDGParams, SeaState, DDGMotionSimulator, ARMAPredictor
 from quad_dynamics.quadrotor import QuadrotorParams, QuadrotorState, QuadrotorDynamics, RotorShutdownModel
-from optimal_control.pseudospectral import PseudospectralSolver, LandingConstraints
+from optimal_control.trajectory_planner import LandingTrajectoryPlanner, TrajectoryResult
 
 
 @dataclass
@@ -50,9 +50,10 @@ class LandingConfig:
     # Trajectory replanning
     replan_interval: float = 0.5        # Replan every 0.5s
 
-    # Cone constraint
+    # Cone constraint (apex BELOW deck, opens upward to landing circle)
     cone_half_angle: float = 30.0       # Cone half-angle (degrees)
-    cone_apex_offset: float = 5.0       # Apex above deck (m)
+    cone_apex_depth: float = 50.0       # Distance from apex to deck (apex below deck)
+    landing_radius: float = 3.0         # Radius of landing circle on deck (m)
 
     # Touchdown
     touchdown_altitude: float = 0.3
@@ -80,21 +81,35 @@ class ApproachCone:
     """
     Approach cone constraint.
 
-    UAV must stay within cone centered on deck, tilted with ship attitude.
-    Cone apex is above deck, cone opens downward/aft for approach.
+    The cone apex is BELOW the flight deck. The cone opens UPWARD and ends
+    in a circular landing area on the deck surface. UAV must stay within
+    this cone during approach.
+
+    Geometry:
+    - Apex is below deck (apex_depth meters below)
+    - Cone axis points upward (negative z in NED) and tilts with ship
+    - At deck level, cone radius equals landing_radius
+    - Cone half-angle = atan(landing_radius / apex_depth)
     """
 
-    def __init__(self, half_angle_deg: float = 30.0, apex_offset: float = 5.0):
+    def __init__(self, half_angle_deg: float = 30.0, apex_depth: float = 50.0, landing_radius: float = 3.0):
+        """
+        Args:
+            half_angle_deg: Cone half-angle (degrees)
+            apex_depth: Distance from apex to deck (m), apex is below deck
+            landing_radius: Radius of landing circle on deck (m)
+        """
         self.half_angle = np.radians(half_angle_deg)
-        self.apex_offset = apex_offset
+        self.apex_depth = apex_depth
+        self.landing_radius = landing_radius
 
     def get_cone_params(self, deck_pos: np.ndarray, deck_att: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Get cone apex and axis given deck state.
 
         Returns:
-            apex: Cone apex position (above deck)
-            axis: Cone axis direction (pointing away from deck into approach zone)
+            apex: Cone apex position (BELOW deck)
+            axis: Cone axis direction (pointing UP toward deck)
         """
         roll, pitch, yaw = deck_att
 
@@ -109,13 +124,13 @@ class ApproachCone:
             [-sp,   sr*cp,            cr*cp]
         ])
 
-        # Apex is above deck (in ship body frame, then rotated)
-        apex_body = np.array([0, 0, -self.apex_offset])  # Up in NED body
+        # Apex is BELOW deck (positive z in NED body = down)
+        apex_body = np.array([0, 0, self.apex_depth])  # Below deck in NED
         apex = deck_pos + R @ apex_body
 
-        # Cone axis points aft and up (approach direction)
-        # In ship body: [-1, 0, -0.5] normalized (aft and up)
-        axis_body = np.array([-1, 0, -0.5])
+        # Cone axis points UP toward deck (negative z in body frame)
+        # Also tilts aft for approach angle
+        axis_body = np.array([-0.3, 0, -1.0])  # Mostly up, slightly aft
         axis_body = axis_body / np.linalg.norm(axis_body)
         axis = R @ axis_body
 
@@ -128,18 +143,25 @@ class ApproachCone:
         # Vector from apex to UAV
         to_uav = uav_pos - apex
 
-        # Distance along cone axis
+        # Distance along cone axis (positive = toward deck)
         dist_along_axis = np.dot(to_uav, axis)
 
         if dist_along_axis <= 0:
-            # Behind apex - only valid if very close to deck
-            return np.linalg.norm(uav_pos - deck_pos) < 3.0
+            # Below apex (very unlikely in practice)
+            return False
 
         # Perpendicular distance from axis
         dist_perp = np.linalg.norm(to_uav - dist_along_axis * axis)
 
-        # Cone radius at this distance
+        # Cone radius at this distance along axis
         cone_radius = dist_along_axis * np.tan(self.half_angle)
+
+        # Also check: if very close to deck, use landing radius instead
+        height_above_deck = -(uav_pos[2] - deck_pos[2])  # NED
+        if height_above_deck < 3.0:
+            # Near deck - just check within landing radius
+            lateral_dist = np.linalg.norm(uav_pos[:2] - deck_pos[:2])
+            return lateral_dist <= self.landing_radius * 1.5
 
         return dist_perp <= cone_radius
 
@@ -154,12 +176,28 @@ class ApproachCone:
         dist_along_axis = np.dot(to_uav, axis)
 
         if dist_along_axis <= 0:
-            return np.linalg.norm(uav_pos - deck_pos) - 3.0
+            return 100.0  # Very far outside (below apex)
 
         dist_perp = np.linalg.norm(to_uav - dist_along_axis * axis)
         cone_radius = dist_along_axis * np.tan(self.half_angle)
 
+        # Near deck - check landing radius
+        height_above_deck = -(uav_pos[2] - deck_pos[2])
+        if height_above_deck < 3.0:
+            lateral_dist = np.linalg.norm(uav_pos[:2] - deck_pos[:2])
+            return lateral_dist - self.landing_radius * 1.5
+
         return dist_perp - cone_radius
+
+    def get_landing_circle(self, deck_pos: np.ndarray, deck_att: np.ndarray) -> Tuple[np.ndarray, float]:
+        """
+        Get the landing circle parameters.
+
+        Returns:
+            center: Center of landing circle (deck position)
+            radius: Landing radius
+        """
+        return deck_pos.copy(), self.landing_radius
 
 
 class ShipMotionPredictor:
@@ -322,23 +360,29 @@ class LandingSimulator:
         self.quad_params = QuadrotorParams()
         self.quad_dynamics = QuadrotorDynamics(self.quad_params)
 
-        # Approach cone
-        self.cone = ApproachCone(self.config.cone_half_angle, self.config.cone_apex_offset)
+        # Approach cone (apex below deck, opens upward to landing circle)
+        self.cone = ApproachCone(
+            half_angle_deg=self.config.cone_half_angle,
+            apex_depth=self.config.cone_apex_depth,
+            landing_radius=self.config.landing_radius
+        )
 
-        # Trajectory planner
-        self.planner = PseudospectralSolver(N=12, params=self.quad_params)
+        # Trajectory planner (minimum snap polynomial trajectories)
+        self.planner = LandingTrajectoryPlanner(self.quad_params)
 
         # State
         self.t = 0
         self.quad_state = None
         self.current_trajectory = None
+        self.trajectory_start_time = None  # When current trajectory was computed
         self.target_deck_state = None
         self.landed = False
         self.shutdown_commanded = False
+        self.waiting_for_window = False  # True when waiting for touchdown window
 
         # History
         self.history = {'t': [], 'quad_pos': [], 'deck_pos': [], 'thrust': [],
-                       'in_cone': [], 'pred_error': []}
+                       'in_cone': [], 'pred_error': [], 'tracking_error': []}
 
     def reset(self):
         """Reset simulation."""
@@ -371,146 +415,315 @@ class LandingSimulator:
         for key in self.history:
             self.history[key] = []
 
+        self.trajectory_start_time = None
+        self.waiting_for_window = False
+
         # Initial trajectory
         self._replan()
 
     def _replan(self):
         """Compute optimal trajectory to predicted deck state."""
-        # Get deck predictions
-        predictions = self.predictor.predict(self.t, self.config.prediction_horizon, self.config.prediction_dt)
+        deck_motion = self.ship_sim.get_motion(self.t)
+        deck_pos = deck_motion['deck_position']
+        deck_vel = deck_motion['deck_velocity']
+        deck_att = deck_motion['attitude']
+
+        # Compute time to intercept based on closing rate
+        # Relative position (UAV to deck)
+        rel_pos = deck_pos - self.quad_state.pos
+        rel_vel = deck_vel - self.quad_state.vel
+
+        # Height above deck
+        height = -rel_pos[2]  # NED: negative z is up
+
+        # Horizontal distance
+        horiz_dist = np.linalg.norm(rel_pos[:2])
+
+        # Estimate intercept time based on current kinematics
+        # Use a simple glide-slope: descend at controlled rate while closing horizontal gap
+        closing_rate_horiz = -np.dot(rel_pos[:2], rel_vel[:2]) / (horiz_dist + 0.1)
+
+        # Safe descent rate (1-2 m/s at touchdown)
+        safe_descent_rate = min(3.0, max(1.0, height / 10.0))
+
+        # Time to reach deck height at safe descent rate
+        t_vertical = height / safe_descent_rate if safe_descent_rate > 0.1 else 10.0
+
+        # Time to close horizontal gap
+        if closing_rate_horiz > 1.0:
+            t_horizontal = horiz_dist / closing_rate_horiz
+        else:
+            # Not closing fast enough - need to accelerate
+            t_horizontal = horiz_dist / 5.0  # Assume we can close at 5 m/s
+
+        # Intercept time is maximum of both (need to satisfy both)
+        t_intercept = max(t_vertical, t_horizontal, 2.0)
+        t_intercept = min(t_intercept, self.config.prediction_horizon)
+
+        # Get ARMA prediction at intercept time
+        predictions = self.predictor.predict(self.t, t_intercept + 1.0, self.config.prediction_dt)
 
         if not predictions:
             return
 
-        # Find best landing time (highest confidence with feasible approach)
+        # Find prediction closest to intercept time
         best_pred = None
-        deck_motion = self.ship_sim.get_motion(self.t)
-
         for pred in predictions:
-            # Check if cone constraint would be satisfied
-            if self.cone.is_inside_cone(self.quad_state.pos, pred.position, pred.attitude):
-                # Check if time is reasonable
-                dist = np.linalg.norm(pred.position - self.quad_state.pos)
-                min_time = dist / 15.0  # Max 15 m/s approach
+            if pred.t - self.t >= t_intercept - 0.3:
+                # Check touchdown window
+                deck_level = (abs(np.degrees(pred.attitude[0])) < self.config.max_deck_roll_deg and
+                             abs(np.degrees(pred.attitude[1])) < self.config.max_deck_pitch_deg)
+                deck_descending = pred.velocity[2] > 0 if self.config.deck_moving_down else True
 
-                if pred.t - self.t >= min_time:
+                if deck_level and deck_descending:
                     best_pred = pred
                     break
+                elif best_pred is None:
+                    best_pred = pred
 
         if best_pred is None:
-            best_pred = predictions[-1]  # Use furthest prediction
+            best_pred = predictions[-1]
 
         self.target_deck_state = best_pred
 
-        # Solve optimal trajectory
-        euler = self.quad_state.quat_to_euler()
-        x_init = np.concatenate([
-            self.quad_state.pos,
-            self.quad_state.vel,
-            euler,
-            self.quad_state.omega
-        ])
-
-        deck_state = np.concatenate([
-            best_pred.position,
-            best_pred.velocity,
-            best_pred.attitude
-        ])
-
-        constraints = LandingConstraints(
-            match_position=True,
-            match_velocity=True,
-            match_roll=True,
-            match_pitch=True,
-            zero_thrust=True
-        )
-
-        tf_guess = best_pred.t - self.t
+        # Plan trajectory using minimum-snap polynomial planner
+        # Use the computed intercept time, not the prediction time
+        tf_actual = max(1.5, best_pred.t - self.t)
 
         try:
-            solution = self.planner.solve(x_init, deck_state, constraints, tf_guess, verbose=False)
-            if solution['success']:
-                self.current_trajectory = solution
-        except:
+            result = self.planner.plan_landing(
+                quad_pos=self.quad_state.pos,
+                quad_vel=self.quad_state.vel,
+                deck_pos=best_pred.position,
+                deck_vel=best_pred.velocity,
+                deck_att=best_pred.attitude,
+                tf_desired=tf_actual
+            )
+
+            # VALIDATE SOLUTION before using
+            if result['success']:
+                pos_err = result['terminal_pos_error']
+                vel_err = result['terminal_vel_error']
+
+                if pos_err < 0.1 and vel_err < 0.1:
+                    self.current_trajectory = result['trajectory']
+                    self.trajectory_start_time = self.t
+
+        except Exception as e:
             pass
 
+    def _interpolate_trajectory(self, t_query: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Interpolate optimal trajectory at given time.
+
+        Returns:
+            target_pos, target_vel, target_thrust
+        """
+        if self.current_trajectory is None or self.trajectory_start_time is None:
+            return None, None, None
+
+        traj = self.current_trajectory  # TrajectoryResult from min-snap planner
+        t_rel = t_query - self.trajectory_start_time  # Time since trajectory start
+        tf = traj.tf
+
+        # Clamp to trajectory bounds
+        t_rel = np.clip(t_rel, 0, tf)
+
+        # Use polynomial evaluation for smooth interpolation
+        sample = self.planner.sample_trajectory(traj, t_rel)
+
+        return sample['position'], sample['velocity'], sample['thrust']
+
     def _get_control(self) -> np.ndarray:
-        """Get control using trajectory tracking."""
-        if self.target_deck_state is None:
-            return np.array([self.quad_params.mass * 9.81, 0, 0, 0])
+        """
+        Get control using proportional navigation guidance.
+
+        Key principle: command descent rate proportional to time-to-go,
+        so that velocity naturally decreases to match deck at intercept.
+        """
+        g = 9.81
+        m = self.quad_params.mass
 
         deck_motion = self.ship_sim.get_motion(self.t)
         deck_pos = deck_motion['deck_position']
         deck_vel = deck_motion['deck_velocity']
         deck_att = deck_motion['attitude']
 
+        # Relative state
+        rel_pos = deck_pos - self.quad_state.pos  # Vector FROM UAV TO deck
+        rel_vel = deck_vel - self.quad_state.vel   # Deck velocity relative to UAV (range rate)
+
         # Height above deck
-        height = -(self.quad_state.pos[2] - deck_pos[2])
+        # In NED: negative z = up
+        # UAV above deck means UAV_z < deck_z (more negative)
+        # rel_pos[2] = deck_z - UAV_z > 0 when UAV is above deck
+        height = rel_pos[2]  # Positive when UAV is above deck
 
-        # Target: predicted deck position with descent profile
-        target_pos = self.target_deck_state.position.copy()
-        target_vel = self.target_deck_state.velocity.copy()
+        # Horizontal distance to deck
+        horiz_dist = np.linalg.norm(rel_pos[:2])
 
-        # Blend toward current deck as we get closer
-        time_to_land = max(self.target_deck_state.t - self.t, 0.5)
-        blend = min(1.0, height / 10.0)  # Blend more to prediction when high
+        # Closing rate: rate at which distance is decreasing
+        # d(dist)/dt = (rel_pos dot rel_vel) / dist
+        # Positive closing rate = getting closer
+        range_rate = np.dot(rel_pos[:2], rel_vel[:2]) / (horiz_dist + 0.1)
+        closing_rate = -range_rate  # Negate because range rate is positive when getting further
 
-        target_pos = blend * target_pos + (1 - blend) * deck_pos
-        target_vel = blend * target_vel + (1 - blend) * deck_vel
+        # Estimate time to go - use a fixed approach profile for predictability
+        # Want to intercept in reasonable time while maintaining control
+        min_intercept_time = 5.0  # At least 5s to intercept
+        max_intercept_time = 15.0  # At most 15s
 
-        # Add descent rate (limit to safe landing speed)
-        descent_rate = min(1.5, max(0.5, height / time_to_land))
-        target_vel[2] = descent_rate
+        # Compute required velocity to intercept in min_intercept_time
+        required_vel_for_fast = np.linalg.norm(rel_pos[:2]) / min_intercept_time
+        max_velocity = 8.0  # Max lateral velocity we want to command
 
-        # Position and velocity errors
-        pos_error = target_pos - self.quad_state.pos
-        vel_error = target_vel - self.quad_state.vel
+        if required_vel_for_fast > max_velocity:
+            # Need more time - use max velocity approach
+            t_go_horiz = horiz_dist / max_velocity
+        else:
+            t_go_horiz = min_intercept_time
 
-        # Cone constraint: push toward cone center if outside
+        t_go_horiz = np.clip(t_go_horiz, min_intercept_time, max_intercept_time)
+
+        # Vertical time to go - controlled descent
+        if height > 2.0:
+            t_go_vert = height / 1.5  # 1.5 m/s descent rate
+        else:
+            t_go_vert = height / 0.5  # Slow down near deck
+
+        # Time to go is the longer of the two (we need to satisfy both)
+        t_go = max(t_go_horiz, t_go_vert, 3.0)
+
+        # ===== HORIZONTAL GUIDANCE =====
+        # Use pursuit guidance: command velocity toward target, blending to deck velocity
+
+        if horiz_dist > 5.0:
+            # Far from deck: pursuit guidance
+            # Desired velocity = direction to target * speed + deck velocity
+            pursuit_speed = min(horiz_dist / 5.0, 6.0)  # Scale speed with distance, cap at 6 m/s
+            los = rel_pos[:2] / horiz_dist
+            pursuit_vel = pursuit_speed * los + deck_vel[:2]
+
+            # Velocity error
+            vel_error = pursuit_vel - self.quad_state.vel[:2]
+
+            # Acceleration to achieve desired velocity
+            Kp_horiz = 2.0
+            horiz_acc_cmd = Kp_horiz * vel_error
+            horiz_acc_cmd = np.clip(horiz_acc_cmd, -5.0, 5.0)
+        else:
+            # Close to deck: match deck velocity with position correction
+            # Blend between position tracking and velocity matching
+            pos_gain = 1.5  # m/s per meter of error
+            vel_gain = 3.0
+
+            # Position correction: velocity toward deck
+            pos_correction = pos_gain * rel_pos[:2]
+
+            # Velocity matching: match deck velocity
+            vel_error = deck_vel[:2] - self.quad_state.vel[:2]
+
+            # Blend: closer = more velocity matching
+            blend = horiz_dist / 5.0  # 1 at 5m, 0 at 0m
+            target_vel = blend * pos_correction + (1 - blend) * (deck_vel[:2] + pos_correction * 0.5)
+            vel_error_total = target_vel - self.quad_state.vel[:2]
+
+            horiz_acc_cmd = vel_gain * vel_error_total
+            horiz_acc_cmd = np.clip(horiz_acc_cmd, -4.0, 4.0)
+
+        # VERTICAL: Control descent to arrive at deck at same time as horizontal intercept
+        # In NED: positive z velocity = moving down
+        # UAV needs to descend (UAV_vz > 0) to close positive height gap
+
+        # Descent rate should match time to horizontal intercept
+        target_descent_rate = height / max(t_go, 3.0)
+
+        # Limit descent rate based on deceleration capability
+        max_decel = 4.0  # m/s² (conservative - max is ~5)
+        effective_height = max(0, height - 0.5)
+        max_safe_descent = np.sqrt(2 * max_decel * effective_height) if effective_height > 0 else 0.3
+        target_descent_rate = min(target_descent_rate, max_safe_descent, 2.0)
+
+        # Near deck: smoothly transition to match deck velocity
+        if height < 3.0:
+            blend = height / 3.0
+            target_descent_rate = blend * target_descent_rate
+            horiz_acc_cmd *= blend  # Reduce horizontal acceleration near deck
+
+        # Vertical velocity control
+        desired_uav_vz = deck_vel[2] + target_descent_rate
+        uav_vz = self.quad_state.vel[2]
+        vert_vel_error = desired_uav_vz - uav_vz
+
+        # Vertical acceleration command (P controller on velocity error)
+        Kp_vert = 5.0
+        acc_cmd_vert = Kp_vert * vert_vel_error
+        acc_cmd_vert = np.clip(acc_cmd_vert, -6, 6)
+
+        # Total commanded acceleration (NED)
+        acc_cmd = np.array([horiz_acc_cmd[0], horiz_acc_cmd[1], acc_cmd_vert])
+
+        # Convert to thrust
+        # In NED: thrust acts upward (negative z direction in body frame)
+        # Equation of motion: m*a = T*(-z_body) + m*g*(+z_ned)
+        # For pure vertical with level attitude: m*a_z = -T + m*g
+        # => T = m*(g - a_z)
+        # For a_z < 0 (upward accel to slow descent): T > m*g (more than hover)
+        # For a_z > 0 (downward accel to speed descent): T < m*g (less than hover)
+
+        # Vertical component
+        T_z = m * (g - acc_cmd[2])
+
+        # Horizontal acceleration requires attitude tilt, which adds to thrust
+        # Approximate: T = sqrt(T_z² + (m*ax)² + (m*ay)²)
+        T = np.sqrt(T_z**2 + (m * acc_cmd[0])**2 + (m * acc_cmd[1])**2)
+        T = np.clip(T, 0.1 * m * g, 1.5 * m * g)
+
+        # Attitude from acceleration direction
+        if T > 0.1 * m * g:
+            roll_target = np.arctan2(acc_cmd[1], g)
+            pitch_target = np.arctan2(-acc_cmd[0], g)
+        else:
+            roll_target = 0
+            pitch_target = 0
+
+        # Near touchdown: blend attitude toward deck attitude
+        if height < 3.0:
+            att_blend = 1 - height / 3.0  # 0 at 3m, 1 at 0m
+            roll_target = (1 - att_blend) * roll_target + att_blend * deck_att[0]
+            pitch_target = (1 - att_blend) * pitch_target + att_blend * deck_att[1]
+
+        # Cone constraint
         cone_dist = self.cone.distance_to_cone_surface(self.quad_state.pos, deck_pos, deck_att)
         if cone_dist > 0:
-            # Outside cone - add correction toward cone axis
             apex, axis = self.cone.get_cone_params(deck_pos, deck_att)
             to_axis = apex - self.quad_state.pos
-            to_axis = to_axis - np.dot(to_axis, axis) * axis  # Perpendicular component
-            pos_error += 0.5 * to_axis  # Push toward cone
+            to_axis = to_axis - np.dot(to_axis, axis) * axis
+            roll_target += 0.05 * to_axis[1]
+            pitch_target -= 0.05 * to_axis[0]
 
-        # PD control (high vertical gains for controlled descent)
-        Kp = np.array([1.0, 1.0, 3.0])
-        Kd = np.array([3.0, 3.0, 6.0])
-        acc_cmd = Kp * pos_error + Kd * vel_error
-
-        acc_cmd = np.clip(acc_cmd, -8, 8)
-
-        # Convert to thrust and attitude
-        g = 9.81
-        m = self.quad_params.mass
-
-        T_z = m * (g + acc_cmd[2])
-        T = np.sqrt(T_z**2 + (m*acc_cmd[0])**2 + (m*acc_cmd[1])**2)
-        T = np.clip(T, 0.2 * m * g, 1.5 * m * g)
-
-        # Match deck attitude as we approach
-        att_blend = max(0, 1 - height / 5.0)
-        roll_target = att_blend * deck_att[0] + (1 - att_blend) * np.arctan2(acc_cmd[1], g)
-        pitch_target = att_blend * deck_att[1] + (1 - att_blend) * np.arctan2(-acc_cmd[0], g)
-
+        # Clamp attitude
         roll_target = np.clip(roll_target, -0.4, 0.4)
         pitch_target = np.clip(pitch_target, -0.4, 0.4)
 
         # Attitude control
-        Kp_att, Kd_att = 20.0, 4.0
+        Kp_att, Kd_att = 25.0, 5.0
         tau_x = Kp_att * (roll_target - self.quad_state.roll) - Kd_att * self.quad_state.omega[0]
         tau_y = Kp_att * (pitch_target - self.quad_state.pitch) - Kd_att * self.quad_state.omega[1]
         tau_z = -Kd_att * self.quad_state.omega[2]
 
-        # Shutdown when close
-        if height < 1.0 and not self.shutdown_commanded:
-            self.shutdown_commanded = True
-            print(f"SHUTDOWN at t={self.t:.2f}s, height={height:.2f}m")
+        # Record tracking error
+        self.history['tracking_error'].append(horiz_dist)
+
+        # Shutdown logic
+        if height < 0.5 and not self.shutdown_commanded:
+            rel_speed = np.linalg.norm(rel_vel)
+            if rel_speed < 2.0:
+                self.shutdown_commanded = True
+                print(f"SHUTDOWN at t={self.t:.2f}s, height={height:.2f}m, rel_vel={rel_speed:.2f}m/s")
 
         if self.shutdown_commanded:
-            T *= 0.3  # Reduce thrust rapidly
+            T *= 0.2
 
         return np.array([T, tau_x, tau_y, tau_z])
 
@@ -524,11 +737,14 @@ class LandingSimulator:
 
         deck_motion = self.ship_sim.get_motion(self.t)
         deck_pos = deck_motion['deck_position']
+        deck_vel = deck_motion['deck_velocity']
 
         # Check touchdown window conditions
-        height = -(self.quad_state.pos[2] - deck_pos[2])
+        # Height = how far above deck the UAV is (positive when UAV above)
+        # In NED: height = deck_z - UAV_z (since more negative z = higher)
+        height = deck_pos[2] - self.quad_state.pos[2]
         deck_att = deck_motion['attitude']
-        deck_vel_z = deck_motion['deck_velocity'][2]  # NED: positive = deck moving down
+        deck_vel_z = deck_vel[2]  # NED: positive = deck moving down
 
         # Check if in touchdown window
         deck_level = (abs(np.degrees(deck_att[0])) < self.config.max_deck_roll_deg and
@@ -540,15 +756,42 @@ class LandingSimulator:
         # Check touchdown
         if height < self.config.touchdown_altitude:
             self.landed = True
-            rel_vel = self.quad_state.vel - deck_motion['deck_velocity']
+            rel_vel = self.quad_state.vel - deck_vel
+
+            # Compute touchdown quality metrics
+            rel_speed = np.linalg.norm(rel_vel)
+            lateral_error = np.sqrt((self.quad_state.pos[0] - deck_pos[0])**2 +
+                                   (self.quad_state.pos[1] - deck_pos[1])**2)
+            roll_error = abs(self.quad_state.roll - deck_att[0])
+            pitch_error = abs(self.quad_state.pitch - deck_att[1])
+
+            print(f"\n{'='*50}")
             print(f"TOUCHDOWN t={self.t:.2f}s")
-            print(f"  Height: {height:.2f}m")
-            print(f"  Relative velocity: [{rel_vel[0]:.2f}, {rel_vel[1]:.2f}, {rel_vel[2]:.2f}] m/s")
-            print(f"  Descent rate: {rel_vel[2]:.2f} m/s (target < {self.config.max_touchdown_velocity:.1f})")
+            print(f"{'='*50}")
+            print(f"  Height: {height:.3f}m")
+            print(f"  Relative velocity: [{rel_vel[0]:.3f}, {rel_vel[1]:.3f}, {rel_vel[2]:.3f}] m/s")
+            print(f"  Relative speed: {rel_speed:.3f} m/s (target < {self.config.max_touchdown_velocity:.1f})")
+            print(f"  Lateral position error: {lateral_error:.3f} m")
+            print(f"  Roll error: {np.degrees(roll_error):.2f}°")
+            print(f"  Pitch error: {np.degrees(pitch_error):.2f}°")
             print(f"  Deck roll: {np.degrees(deck_att[0]):.1f}°, pitch: {np.degrees(deck_att[1]):.1f}°")
-            print(f"  Deck heave rate: {deck_vel_z:.2f} m/s")
+            print(f"  Deck heave rate: {deck_vel_z:.3f} m/s ({'down' if deck_vel_z > 0 else 'up'})")
             print(f"  In window: {in_window} (level={deck_level}, descending={deck_descending})")
+
+            # Success criteria
+            velocity_ok = rel_speed < self.config.max_touchdown_velocity
+            position_ok = lateral_error < 1.0
+            attitude_ok = roll_error < 0.1 and pitch_error < 0.1
+
+            print(f"\n  Success metrics:")
+            print(f"    Velocity matched: {'YES' if velocity_ok else 'NO'}")
+            print(f"    Position matched: {'YES' if position_ok else 'NO'}")
+            print(f"    Attitude matched: {'YES' if attitude_ok else 'NO'}")
+            print(f"    In touchdown window: {'YES' if in_window else 'NO'}")
+            print(f"{'='*50}\n")
+
             self.final_rel_vel = rel_vel
+            self.touchdown_success = velocity_ok and position_ok and attitude_ok
             return
 
         # Get and apply control
@@ -575,17 +818,30 @@ class LandingSimulator:
             self._replan()
 
     def _step_quad(self, u: np.ndarray, dt: float):
-        """Step quadrotor dynamics."""
+        """Step quadrotor dynamics with thrust-prioritized motor allocation."""
         T, tau_x, tau_y, tau_z = u
         p = self.quad_params
         L = p.arm_length
         s45 = np.sin(np.pi/4)
 
+        # Maximum torque that can be applied without losing thrust
+        # With T_per = T/4 per motor, max torque increment per motor = min(T_per, max_thrust - T_per)
         T_per = T / 4
-        T1 = T_per + tau_x/(4*L*s45) + tau_y/(4*L*s45)
-        T2 = T_per + tau_x/(4*L*s45) - tau_y/(4*L*s45)
-        T3 = T_per - tau_x/(4*L*s45) - tau_y/(4*L*s45)
-        T4 = T_per - tau_x/(4*L*s45) + tau_y/(4*L*s45)
+        max_torque_per_motor = min(T_per, p.max_thrust_per_rotor - T_per)
+
+        # Torque to motor thrust conversion factor
+        torque_to_motor = 1 / (4 * L * s45)
+
+        # Limit torques to avoid thrust loss
+        max_tau = max_torque_per_motor / torque_to_motor
+        tau_x = np.clip(tau_x, -max_tau, max_tau)
+        tau_y = np.clip(tau_y, -max_tau, max_tau)
+
+        # Now compute motor thrusts (won't saturate due to torque limiting)
+        T1 = T_per + tau_x * torque_to_motor + tau_y * torque_to_motor
+        T2 = T_per + tau_x * torque_to_motor - tau_y * torque_to_motor
+        T3 = T_per - tau_x * torque_to_motor - tau_y * torque_to_motor
+        T4 = T_per - tau_x * torque_to_motor + tau_y * torque_to_motor
 
         motor_thrusts = np.clip([T1, T2, T3, T4], 0, p.max_thrust_per_rotor)
         self.quad_state = self.quad_dynamics.step(self.quad_state, motor_thrusts, dt)
@@ -617,8 +873,10 @@ def demo():
         ship_speed_kts=15,
         approach_altitude=25,
         approach_distance=50,
-        approach_speed=5.0,  # Slower approach
-        cone_half_angle=35
+        approach_speed=12.0,  # Must be faster than ship speed (15kt = 7.7m/s)
+        cone_half_angle=30,
+        cone_apex_depth=50.0,  # Apex 50m below deck
+        landing_radius=3.0     # 3m landing circle
     )
 
     print(f"Sea state: {config.sea_state}, Ship: {config.ship_speed_kts} kts")
