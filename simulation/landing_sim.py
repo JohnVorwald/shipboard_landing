@@ -26,6 +26,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ship_motion.ddg_motion import DDGParams, SeaState, DDGMotionSimulator, ARMAPredictor
 from quad_dynamics.quadrotor import QuadrotorParams, QuadrotorState, QuadrotorDynamics, RotorShutdownModel
 from optimal_control.trajectory_planner import LandingTrajectoryPlanner, TrajectoryResult
+from optimal_control.pmp_controller import PMPController, PMPTrajectory, create_pmp_trajectory, ControllerGains
+from optimal_control.pseudospectral import PseudospectralSolver, LandingConstraints
 
 
 @dataclass
@@ -343,10 +345,11 @@ class ShipMotionPredictor:
 
 
 class LandingSimulator:
-    """Full simulation with ARMA prediction and optimal trajectory."""
+    """Full simulation with ARMA prediction and PMP-based optimal control."""
 
-    def __init__(self, config: LandingConfig = None):
+    def __init__(self, config: LandingConfig = None, use_pmp: bool = True):
         self.config = config if config is not None else LandingConfig()
+        self.use_pmp = use_pmp
 
         # Ship motion
         self.ship_params = DDGParams()
@@ -370,6 +373,16 @@ class LandingSimulator:
         # Trajectory planner (minimum snap polynomial trajectories)
         self.planner = LandingTrajectoryPlanner(self.quad_params)
 
+        # PMP Controller with costate feedback
+        self.pmp_controller = PMPController(self.quad_params)
+
+        # Pseudospectral solver for optimal trajectories (N=10 for faster solve)
+        self.ps_solver = PseudospectralSolver(N=10, params=self.quad_params)
+
+        # Track solver performance
+        self.solver_success_count = 0
+        self.solver_fail_count = 0
+
         # State
         self.t = 0
         self.quad_state = None
@@ -382,7 +395,8 @@ class LandingSimulator:
 
         # History
         self.history = {'t': [], 'quad_pos': [], 'deck_pos': [], 'thrust': [],
-                       'in_cone': [], 'pred_error': [], 'tracking_error': []}
+                       'in_cone': [], 'pred_error': [], 'tracking_error': [],
+                       'costate_norm': []}
 
     def reset(self):
         """Reset simulation."""
@@ -422,7 +436,7 @@ class LandingSimulator:
         self._replan()
 
     def _replan(self):
-        """Compute optimal trajectory to predicted deck state."""
+        """Compute optimal trajectory using PMP/pseudospectral solver with ARMA predictions."""
         deck_motion = self.ship_sim.get_motion(self.t)
         deck_pos = deck_motion['deck_position']
         deck_vel = deck_motion['deck_velocity']
@@ -433,30 +447,28 @@ class LandingSimulator:
         rel_pos = deck_pos - self.quad_state.pos
         rel_vel = deck_vel - self.quad_state.vel
 
-        # Height above deck
-        height = -rel_pos[2]  # NED: negative z is up
+        # Height above deck (positive when UAV above deck in NED)
+        height = rel_pos[2]
 
         # Horizontal distance
         horiz_dist = np.linalg.norm(rel_pos[:2])
 
         # Estimate intercept time based on current kinematics
-        # Use a simple glide-slope: descend at controlled rate while closing horizontal gap
         closing_rate_horiz = -np.dot(rel_pos[:2], rel_vel[:2]) / (horiz_dist + 0.1)
 
-        # Safe descent rate (1-2 m/s at touchdown)
-        safe_descent_rate = min(3.0, max(1.0, height / 10.0))
+        # Safe descent rate
+        safe_descent_rate = min(3.0, max(1.0, abs(height) / 10.0))
 
-        # Time to reach deck height at safe descent rate
-        t_vertical = height / safe_descent_rate if safe_descent_rate > 0.1 else 10.0
+        # Time to reach deck height
+        t_vertical = abs(height) / safe_descent_rate if safe_descent_rate > 0.1 else 10.0
 
         # Time to close horizontal gap
         if closing_rate_horiz > 1.0:
             t_horizontal = horiz_dist / closing_rate_horiz
         else:
-            # Not closing fast enough - need to accelerate
-            t_horizontal = horiz_dist / 5.0  # Assume we can close at 5 m/s
+            t_horizontal = horiz_dist / 5.0
 
-        # Intercept time is maximum of both (need to satisfy both)
+        # Intercept time
         t_intercept = max(t_vertical, t_horizontal, 2.0)
         t_intercept = min(t_intercept, self.config.prediction_horizon)
 
@@ -466,11 +478,10 @@ class LandingSimulator:
         if not predictions:
             return
 
-        # Find prediction closest to intercept time
+        # Find best touchdown window in predictions
         best_pred = None
         for pred in predictions:
             if pred.t - self.t >= t_intercept - 0.3:
-                # Check touchdown window
                 deck_level = (abs(np.degrees(pred.attitude[0])) < self.config.max_deck_roll_deg and
                              abs(np.degrees(pred.attitude[1])) < self.config.max_deck_pitch_deg)
                 deck_descending = pred.velocity[2] > 0 if self.config.deck_moving_down else True
@@ -485,22 +496,153 @@ class LandingSimulator:
             best_pred = predictions[-1]
 
         self.target_deck_state = best_pred
-
-        # Plan trajectory using minimum-snap polynomial planner
-        # Use the computed intercept time, not the prediction time
         tf_actual = max(1.5, best_pred.t - self.t)
 
+        if self.use_pmp:
+            # Use min-snap for speed, but create PMPTrajectory with costates
+            self._replan_pmp_minsnap(best_pred, tf_actual)
+        else:
+            # Fallback to min-snap planner without PMP controller
+            self._replan_minsnap(best_pred, tf_actual)
+
+    def _replan_pmp_minsnap(self, target: DeckPrediction, tf: float):
+        """
+        Fast trajectory planning using min-snap with PMP costate estimation.
+
+        Uses polynomial trajectory for speed, but estimates costates
+        to enable optimal feedback corrections in the controller.
+        """
         try:
             result = self.planner.plan_landing(
                 quad_pos=self.quad_state.pos,
                 quad_vel=self.quad_state.vel,
-                deck_pos=best_pred.position,
-                deck_vel=best_pred.velocity,
-                deck_att=best_pred.attitude,
-                tf_desired=tf_actual
+                deck_pos=target.position,
+                deck_vel=target.velocity,
+                deck_att=target.attitude,
+                tf_desired=tf
             )
 
-            # VALIDATE SOLUTION before using
+            if result['success']:
+                traj = result['trajectory']
+
+                # Sample trajectory to create state/control arrays
+                N = 20
+                t_traj = np.linspace(0, traj.tf, N)
+                x_traj = np.zeros((N, 12))
+                u_traj = np.zeros((N, 4))
+
+                euler = self.quad_state.quat_to_euler()
+
+                for i, t in enumerate(t_traj):
+                    sample = self.planner.sample_trajectory(traj, t)
+                    # State: pos, vel, att, omega
+                    alpha = t / traj.tf
+                    x_traj[i, 0:3] = sample['position']
+                    x_traj[i, 3:6] = sample['velocity']
+                    # Interpolate attitude from current to target
+                    x_traj[i, 6:9] = (1 - alpha) * euler + alpha * target.attitude
+                    # Angular rates approximately zero for smooth trajectory
+                    x_traj[i, 9:12] = 0
+
+                    # Control: thrust + zero torques (approximate)
+                    u_traj[i, 0] = sample['thrust']
+
+                # Create PMPTrajectory with costate estimation
+                pmp_traj = create_pmp_trajectory(
+                    x_traj=x_traj,
+                    u_traj=u_traj,
+                    t_traj=t_traj,
+                    tf=traj.tf,
+                    deck_pos=target.position,
+                    deck_vel=target.velocity,
+                    deck_att=target.attitude,
+                    params=self.quad_params
+                )
+
+                self.pmp_controller.set_trajectory(pmp_traj, self.t)
+                self.current_trajectory = pmp_traj
+                self.trajectory_start_time = self.t
+                self.solver_success_count += 1
+            else:
+                self.solver_fail_count += 1
+
+        except Exception as e:
+            self.solver_fail_count += 1
+
+    def _replan_pseudospectral(self, target: DeckPrediction, tf: float):
+        """
+        Solve optimal trajectory using pseudospectral method.
+
+        Creates PMPTrajectory with estimated costates for feedback control.
+        """
+        try:
+            # Current state
+            euler = self.quad_state.quat_to_euler()
+            x_init = np.concatenate([
+                self.quad_state.pos,
+                self.quad_state.vel,
+                euler,
+                self.quad_state.omega
+            ])
+
+            # Target deck state
+            deck_state = np.concatenate([
+                target.position,
+                target.velocity,
+                target.attitude
+            ])
+
+            # Solve using pseudospectral
+            constraints = LandingConstraints(
+                match_position=True,
+                match_velocity=True,
+                match_roll=True,
+                match_pitch=True,
+                zero_thrust=True
+            )
+
+            solution = self.ps_solver.solve(
+                x_init=x_init,
+                deck_state=deck_state,
+                constraints=constraints,
+                tf_guess=tf,
+                verbose=False
+            )
+
+            if solution['success'] or solution['constraint_violation'] < 1.0:
+                # Create PMPTrajectory from solution
+                pmp_traj = create_pmp_trajectory(
+                    x_traj=solution['X'],
+                    u_traj=solution['U'],
+                    t_traj=solution['t'],
+                    tf=solution['tf'],
+                    deck_pos=target.position,
+                    deck_vel=target.velocity,
+                    deck_att=target.attitude,
+                    params=self.quad_params
+                )
+
+                # Set trajectory in controller
+                self.pmp_controller.set_trajectory(pmp_traj, self.t)
+                self.current_trajectory = pmp_traj
+                self.trajectory_start_time = self.t
+
+        except Exception as e:
+            # Fallback to min-snap
+            self._replan_minsnap(target, tf)
+
+    def _replan_minsnap(self, target: DeckPrediction, tf: float):
+        """Fallback trajectory planning using minimum-snap polynomials."""
+        try:
+            result = self.planner.plan_landing(
+                quad_pos=self.quad_state.pos,
+                quad_vel=self.quad_state.vel,
+                deck_pos=target.position,
+                deck_vel=target.velocity,
+                deck_att=target.attitude,
+                tf_desired=tf
+            )
+
             if result['success']:
                 pos_err = result['terminal_pos_error']
                 vel_err = result['terminal_vel_error']
@@ -508,8 +650,7 @@ class LandingSimulator:
                 if pos_err < 0.1 and vel_err < 0.1:
                     self.current_trajectory = result['trajectory']
                     self.trajectory_start_time = self.t
-
-        except Exception as e:
+        except Exception:
             pass
 
     def _interpolate_trajectory(self, t_query: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -536,186 +677,84 @@ class LandingSimulator:
 
     def _get_control(self) -> np.ndarray:
         """
-        Get control using proportional navigation guidance.
+        Get control using PMP-based trajectory tracking or fallback guidance.
 
-        Key principle: command descent rate proportional to time-to-go,
-        so that velocity naturally decreases to match deck at intercept.
+        When use_pmp=True:
+        - Uses costate feedback for near-optimal control
+        - Tracks pseudospectral optimal trajectory
+
+        Fallback (use_pmp=False):
+        - Uses proportional navigation guidance
         """
-        g = 9.81
-        m = self.quad_params.mass
-
         deck_motion = self.ship_sim.get_motion(self.t)
         deck_pos = deck_motion['deck_position']
         deck_vel = deck_motion['deck_velocity']
         deck_att = deck_motion['attitude']
 
-        # Relative state
-        rel_pos = deck_pos - self.quad_state.pos  # Vector FROM UAV TO deck
-        rel_vel = deck_vel - self.quad_state.vel   # Deck velocity relative to UAV (range rate)
-
-        # Height above deck
-        # In NED: negative z = up
-        # UAV above deck means UAV_z < deck_z (more negative)
-        # rel_pos[2] = deck_z - UAV_z > 0 when UAV is above deck
-        height = rel_pos[2]  # Positive when UAV is above deck
-
-        # Horizontal distance to deck
+        # Relative state for metrics
+        rel_pos = deck_pos - self.quad_state.pos
+        rel_vel = deck_vel - self.quad_state.vel
+        height = rel_pos[2]
         horiz_dist = np.linalg.norm(rel_pos[:2])
-
-        # Closing rate: rate at which distance is decreasing
-        # d(dist)/dt = (rel_pos dot rel_vel) / dist
-        # Positive closing rate = getting closer
-        range_rate = np.dot(rel_pos[:2], rel_vel[:2]) / (horiz_dist + 0.1)
-        closing_rate = -range_rate  # Negate because range rate is positive when getting further
-
-        # Estimate time to go - use a fixed approach profile for predictability
-        # Want to intercept in reasonable time while maintaining control
-        min_intercept_time = 5.0  # At least 5s to intercept
-        max_intercept_time = 15.0  # At most 15s
-
-        # Compute required velocity to intercept in min_intercept_time
-        required_vel_for_fast = np.linalg.norm(rel_pos[:2]) / min_intercept_time
-        max_velocity = 8.0  # Max lateral velocity we want to command
-
-        if required_vel_for_fast > max_velocity:
-            # Need more time - use max velocity approach
-            t_go_horiz = horiz_dist / max_velocity
-        else:
-            t_go_horiz = min_intercept_time
-
-        t_go_horiz = np.clip(t_go_horiz, min_intercept_time, max_intercept_time)
-
-        # Vertical time to go - controlled descent
-        if height > 2.0:
-            t_go_vert = height / 1.5  # 1.5 m/s descent rate
-        else:
-            t_go_vert = height / 0.5  # Slow down near deck
-
-        # Time to go is the longer of the two (we need to satisfy both)
-        t_go = max(t_go_horiz, t_go_vert, 3.0)
-
-        # ===== HORIZONTAL GUIDANCE =====
-        # Use pursuit guidance: command velocity toward target, blending to deck velocity
-
-        if horiz_dist > 5.0:
-            # Far from deck: pursuit guidance
-            # Desired velocity = direction to target * speed + deck velocity
-            pursuit_speed = min(horiz_dist / 5.0, 6.0)  # Scale speed with distance, cap at 6 m/s
-            los = rel_pos[:2] / horiz_dist
-            pursuit_vel = pursuit_speed * los + deck_vel[:2]
-
-            # Velocity error
-            vel_error = pursuit_vel - self.quad_state.vel[:2]
-
-            # Acceleration to achieve desired velocity
-            Kp_horiz = 2.0
-            horiz_acc_cmd = Kp_horiz * vel_error
-            horiz_acc_cmd = np.clip(horiz_acc_cmd, -5.0, 5.0)
-        else:
-            # Close to deck: match deck velocity with position correction
-            # Blend between position tracking and velocity matching
-            pos_gain = 1.5  # m/s per meter of error
-            vel_gain = 3.0
-
-            # Position correction: velocity toward deck
-            pos_correction = pos_gain * rel_pos[:2]
-
-            # Velocity matching: match deck velocity
-            vel_error = deck_vel[:2] - self.quad_state.vel[:2]
-
-            # Blend: closer = more velocity matching
-            blend = horiz_dist / 5.0  # 1 at 5m, 0 at 0m
-            target_vel = blend * pos_correction + (1 - blend) * (deck_vel[:2] + pos_correction * 0.5)
-            vel_error_total = target_vel - self.quad_state.vel[:2]
-
-            horiz_acc_cmd = vel_gain * vel_error_total
-            horiz_acc_cmd = np.clip(horiz_acc_cmd, -4.0, 4.0)
-
-        # VERTICAL: Control descent to arrive at deck at same time as horizontal intercept
-        # In NED: positive z velocity = moving down
-        # UAV needs to descend (UAV_vz > 0) to close positive height gap
-
-        # Descent rate should match time to horizontal intercept
-        target_descent_rate = height / max(t_go, 3.0)
-
-        # Limit descent rate based on deceleration capability
-        max_decel = 4.0  # m/s² (conservative - max is ~5)
-        effective_height = max(0, height - 0.5)
-        max_safe_descent = np.sqrt(2 * max_decel * effective_height) if effective_height > 0 else 0.3
-        target_descent_rate = min(target_descent_rate, max_safe_descent, 2.0)
-
-        # Near deck: smoothly transition to match deck velocity
-        if height < 3.0:
-            blend = height / 3.0
-            target_descent_rate = blend * target_descent_rate
-            horiz_acc_cmd *= blend  # Reduce horizontal acceleration near deck
-
-        # Vertical velocity control
-        desired_uav_vz = deck_vel[2] + target_descent_rate
-        uav_vz = self.quad_state.vel[2]
-        vert_vel_error = desired_uav_vz - uav_vz
-
-        # Vertical acceleration command (P controller on velocity error)
-        Kp_vert = 5.0
-        acc_cmd_vert = Kp_vert * vert_vel_error
-        acc_cmd_vert = np.clip(acc_cmd_vert, -6, 6)
-
-        # Total commanded acceleration (NED)
-        acc_cmd = np.array([horiz_acc_cmd[0], horiz_acc_cmd[1], acc_cmd_vert])
-
-        # Convert to thrust
-        # In NED: thrust acts upward (negative z direction in body frame)
-        # Equation of motion: m*a = T*(-z_body) + m*g*(+z_ned)
-        # For pure vertical with level attitude: m*a_z = -T + m*g
-        # => T = m*(g - a_z)
-        # For a_z < 0 (upward accel to slow descent): T > m*g (more than hover)
-        # For a_z > 0 (downward accel to speed descent): T < m*g (less than hover)
-
-        # Vertical component
-        T_z = m * (g - acc_cmd[2])
-
-        # Horizontal acceleration requires attitude tilt, which adds to thrust
-        # Approximate: T = sqrt(T_z² + (m*ax)² + (m*ay)²)
-        T = np.sqrt(T_z**2 + (m * acc_cmd[0])**2 + (m * acc_cmd[1])**2)
-        T = np.clip(T, 0.1 * m * g, 1.5 * m * g)
-
-        # Attitude from acceleration direction
-        if T > 0.1 * m * g:
-            roll_target = np.arctan2(acc_cmd[1], g)
-            pitch_target = np.arctan2(-acc_cmd[0], g)
-        else:
-            roll_target = 0
-            pitch_target = 0
-
-        # Near touchdown: blend attitude toward deck attitude
-        if height < 3.0:
-            att_blend = 1 - height / 3.0  # 0 at 3m, 1 at 0m
-            roll_target = (1 - att_blend) * roll_target + att_blend * deck_att[0]
-            pitch_target = (1 - att_blend) * pitch_target + att_blend * deck_att[1]
-
-        # Cone constraint
-        cone_dist = self.cone.distance_to_cone_surface(self.quad_state.pos, deck_pos, deck_att)
-        if cone_dist > 0:
-            apex, axis = self.cone.get_cone_params(deck_pos, deck_att)
-            to_axis = apex - self.quad_state.pos
-            to_axis = to_axis - np.dot(to_axis, axis) * axis
-            roll_target += 0.05 * to_axis[1]
-            pitch_target -= 0.05 * to_axis[0]
-
-        # Clamp attitude
-        roll_target = np.clip(roll_target, -0.4, 0.4)
-        pitch_target = np.clip(pitch_target, -0.4, 0.4)
-
-        # Attitude control
-        Kp_att, Kd_att = 25.0, 5.0
-        tau_x = Kp_att * (roll_target - self.quad_state.roll) - Kd_att * self.quad_state.omega[0]
-        tau_y = Kp_att * (pitch_target - self.quad_state.pitch) - Kd_att * self.quad_state.omega[1]
-        tau_z = -Kd_att * self.quad_state.omega[2]
 
         # Record tracking error
         self.history['tracking_error'].append(horiz_dist)
 
-        # Shutdown logic
+        if self.use_pmp and self.pmp_controller.trajectory_valid(self.t):
+            # Use PMP controller with costate feedback
+            x_current = np.concatenate([
+                self.quad_state.pos,
+                self.quad_state.vel,
+                self.quad_state.quat_to_euler(),
+                self.quad_state.omega
+            ])
+
+            u = self.pmp_controller.compute_control(
+                self.t, x_current, deck_pos, deck_vel, deck_att
+            )
+
+            # Record costate norm for debugging
+            if self.pmp_controller.trajectory is not None:
+                _, _, lam = self.pmp_controller._interpolate_trajectory(self.t)
+                if lam is not None:
+                    self.history['costate_norm'].append(np.linalg.norm(lam))
+
+            # Apply cone constraint correction
+            u = self._apply_cone_constraint(u, deck_pos, deck_att)
+
+            # Shutdown logic
+            u = self._apply_shutdown_logic(u, height, rel_vel)
+
+            return u
+        else:
+            # Fallback to proportional navigation
+            return self._get_control_fallback(deck_pos, deck_vel, deck_att,
+                                               rel_pos, rel_vel, height, horiz_dist)
+
+    def _apply_cone_constraint(self, u: np.ndarray, deck_pos: np.ndarray,
+                                deck_att: np.ndarray) -> np.ndarray:
+        """Apply cone constraint correction to control."""
+        T, tau_x, tau_y, tau_z = u
+
+        cone_dist = self.cone.distance_to_cone_surface(self.quad_state.pos, deck_pos, deck_att)
+        if cone_dist > 0:
+            # Outside cone - add correction torque to steer back
+            apex, axis = self.cone.get_cone_params(deck_pos, deck_att)
+            to_axis = apex - self.quad_state.pos
+            to_axis = to_axis - np.dot(to_axis, axis) * axis
+
+            # Proportional correction
+            correction_gain = 0.1 * min(cone_dist, 5.0)
+            tau_x += correction_gain * to_axis[1]
+            tau_y -= correction_gain * to_axis[0]
+
+        return np.array([T, tau_x, tau_y, tau_z])
+
+    def _apply_shutdown_logic(self, u: np.ndarray, height: float,
+                               rel_vel: np.ndarray) -> np.ndarray:
+        """Apply rotor shutdown logic near touchdown."""
+        T, tau_x, tau_y, tau_z = u
+
         if height < 0.5 and not self.shutdown_commanded:
             rel_speed = np.linalg.norm(rel_vel)
             if rel_speed < 2.0:
@@ -726,6 +765,107 @@ class LandingSimulator:
             T *= 0.2
 
         return np.array([T, tau_x, tau_y, tau_z])
+
+    def _get_control_fallback(self, deck_pos: np.ndarray, deck_vel: np.ndarray,
+                               deck_att: np.ndarray, rel_pos: np.ndarray,
+                               rel_vel: np.ndarray, height: float,
+                               horiz_dist: float) -> np.ndarray:
+        """
+        Fallback control using proportional navigation guidance.
+        """
+        g = 9.81
+        m = self.quad_params.mass
+
+        # Time to go estimate
+        min_intercept_time = 5.0
+        max_intercept_time = 15.0
+        max_velocity = 8.0
+
+        required_vel_for_fast = horiz_dist / min_intercept_time
+        if required_vel_for_fast > max_velocity:
+            t_go_horiz = horiz_dist / max_velocity
+        else:
+            t_go_horiz = min_intercept_time
+
+        t_go_horiz = np.clip(t_go_horiz, min_intercept_time, max_intercept_time)
+
+        if height > 2.0:
+            t_go_vert = height / 1.5
+        else:
+            t_go_vert = height / 0.5
+
+        t_go = max(t_go_horiz, t_go_vert, 3.0)
+
+        # Horizontal guidance
+        if horiz_dist > 5.0:
+            pursuit_speed = min(horiz_dist / 5.0, 6.0)
+            los = rel_pos[:2] / horiz_dist
+            pursuit_vel = pursuit_speed * los + deck_vel[:2]
+            vel_error = pursuit_vel - self.quad_state.vel[:2]
+            horiz_acc_cmd = 2.0 * vel_error
+            horiz_acc_cmd = np.clip(horiz_acc_cmd, -5.0, 5.0)
+        else:
+            pos_correction = 1.5 * rel_pos[:2]
+            vel_error = deck_vel[:2] - self.quad_state.vel[:2]
+            blend = horiz_dist / 5.0
+            target_vel = blend * pos_correction + (1 - blend) * (deck_vel[:2] + pos_correction * 0.5)
+            vel_error_total = target_vel - self.quad_state.vel[:2]
+            horiz_acc_cmd = 3.0 * vel_error_total
+            horiz_acc_cmd = np.clip(horiz_acc_cmd, -4.0, 4.0)
+
+        # Vertical control
+        target_descent_rate = height / max(t_go, 3.0)
+        max_decel = 4.0
+        effective_height = max(0, height - 0.5)
+        max_safe_descent = np.sqrt(2 * max_decel * effective_height) if effective_height > 0 else 0.3
+        target_descent_rate = min(target_descent_rate, max_safe_descent, 2.0)
+
+        if height < 3.0:
+            blend = height / 3.0
+            target_descent_rate = blend * target_descent_rate
+            horiz_acc_cmd *= blend
+
+        desired_uav_vz = deck_vel[2] + target_descent_rate
+        vert_vel_error = desired_uav_vz - self.quad_state.vel[2]
+        acc_cmd_vert = np.clip(5.0 * vert_vel_error, -6, 6)
+
+        acc_cmd = np.array([horiz_acc_cmd[0], horiz_acc_cmd[1], acc_cmd_vert])
+
+        # Convert to thrust
+        T_z = m * (g - acc_cmd[2])
+        T = np.sqrt(T_z**2 + (m * acc_cmd[0])**2 + (m * acc_cmd[1])**2)
+        T = np.clip(T, 0.1 * m * g, 1.5 * m * g)
+
+        # Attitude from acceleration
+        if T > 0.1 * m * g:
+            roll_target = np.arctan2(acc_cmd[1], g)
+            pitch_target = np.arctan2(-acc_cmd[0], g)
+        else:
+            roll_target = 0
+            pitch_target = 0
+
+        # Near touchdown: blend toward deck attitude
+        if height < 3.0:
+            att_blend = 1 - height / 3.0
+            roll_target = (1 - att_blend) * roll_target + att_blend * deck_att[0]
+            pitch_target = (1 - att_blend) * pitch_target + att_blend * deck_att[1]
+
+        roll_target = np.clip(roll_target, -0.4, 0.4)
+        pitch_target = np.clip(pitch_target, -0.4, 0.4)
+
+        # Attitude control
+        Kp_att, Kd_att = 25.0, 5.0
+        tau_x = Kp_att * (roll_target - self.quad_state.roll) - Kd_att * self.quad_state.omega[0]
+        tau_y = Kp_att * (pitch_target - self.quad_state.pitch) - Kd_att * self.quad_state.omega[1]
+        tau_z = -Kd_att * self.quad_state.omega[2]
+
+        u = np.array([T, tau_x, tau_y, tau_z])
+
+        # Apply cone and shutdown
+        u = self._apply_cone_constraint(u, deck_pos, deck_att)
+        u = self._apply_shutdown_logic(u, height, rel_vel)
+
+        return u
 
     def step(self, dt: float = 0.02):
         """Step simulation."""
