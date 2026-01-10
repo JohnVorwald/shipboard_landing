@@ -699,6 +699,284 @@ class PseudospectralSolver:
             'warnings': warnings
         }
 
+    def solve_free_time(self, x_init: np.ndarray,
+                        deck_motion_fn,
+                        t_current: float,
+                        touchdown_constraints: dict = None,
+                        tf_bounds: Tuple[float, float] = (2.0, 15.0),
+                        verbose: bool = True) -> dict:
+        """
+        Solve optimal landing with FREE FINAL TIME.
+
+        Final time tf is a decision variable, determined by touchdown constraints:
+        - |deck_roll| <= max_roll (default 5°)
+        - |deck_pitch| <= max_pitch (default 5°)
+        - deck_heave_velocity > 0 (deck moving DOWN in NED)
+
+        Args:
+            x_init: Initial quadrotor state [pos, vel, att, omega]
+            deck_motion_fn: Function(t) -> dict with 'deck_position', 'deck_velocity', 'attitude'
+            t_current: Current simulation time
+            touchdown_constraints: Dict with max_roll_deg, max_pitch_deg, require_descending
+            tf_bounds: (min_tf, max_tf) bounds on final time
+            verbose: Print progress
+
+        Returns:
+            Solution dictionary with optimal trajectory and landing time
+        """
+        if touchdown_constraints is None:
+            touchdown_constraints = {
+                'max_roll_deg': 5.0,
+                'max_pitch_deg': 5.0,
+                'require_descending': True
+            }
+
+        max_roll = np.radians(touchdown_constraints.get('max_roll_deg', 5.0))
+        max_pitch = np.radians(touchdown_constraints.get('max_pitch_deg', 5.0))
+        require_descending = touchdown_constraints.get('require_descending', True)
+
+        N, nx, nu = self.N + 1, self.nx, self.nu
+        tf_min, tf_max = tf_bounds
+
+        # Decision variables: [X (N*nx), U (N*nu), tf]
+        # tf is time from now (t_current) to landing
+
+        def get_deck_state_at_tf(tf_from_now):
+            """Get deck state at landing time = t_current + tf_from_now"""
+            t_land = t_current + tf_from_now
+            motion = deck_motion_fn(t_land)
+            return {
+                'pos': motion['deck_position'],
+                'vel': motion['deck_velocity'],
+                'att': motion['attitude']
+            }
+
+        # Objective: control effort + time + touchdown constraint violation penalty
+        def objective(z):
+            X, U, tf = self.unpack_decision_vars(z)
+            deck = get_deck_state_at_tf(tf)
+
+            # Control cost (LGL quadrature)
+            R = np.diag([0.001, 0.01, 0.01, 0.01])
+            control_cost = 0
+            for i in range(N):
+                control_cost += self.w[i] * (U[i] @ R @ U[i])
+            control_cost *= tf / 2
+
+            # Time penalty (encourage faster landing)
+            time_penalty = 0.3 * tf
+
+            # Penalty for violating deck attitude constraints at touchdown
+            roll_viol = max(0, abs(deck['att'][0]) - max_roll)
+            pitch_viol = max(0, abs(deck['att'][1]) - max_pitch)
+            att_penalty = 100 * (roll_viol**2 + pitch_viol**2)
+
+            # Penalty if deck not descending (heave vel > 0 means going down in NED)
+            if require_descending:
+                heave_vel = deck['vel'][2]
+                if heave_vel < 0:  # Deck moving up
+                    descend_penalty = 50 * heave_vel**2
+                else:
+                    descend_penalty = 0
+            else:
+                descend_penalty = 0
+
+            return control_cost + time_penalty + att_penalty + descend_penalty
+
+        # Equality constraints
+        def eq_constraints(z):
+            X, U, tf = self.unpack_decision_vars(z)
+            deck = get_deck_state_at_tf(tf)
+
+            deck_state = np.concatenate([deck['pos'], deck['vel'], deck['att']])
+            constraints = LandingConstraints(
+                match_position=True,
+                match_velocity=True,
+                match_roll=True,
+                match_pitch=True,
+                zero_thrust=True
+            )
+
+            residuals = []
+
+            # Dynamics constraints at interior nodes
+            for i in range(1, self.N):
+                x_dot_approx = np.zeros(self.nx)
+                for j in range(N):
+                    x_dot_approx += self.D[i, j] * X[j]
+                x_dot_approx *= 2 / tf
+
+                x_dot_exact = self.dynamics(X[i], U[i])
+                residuals.append(x_dot_approx - x_dot_exact)
+
+            # Initial conditions
+            residuals.append(X[0] - x_init)
+
+            # Terminal conditions - match deck at landing time
+            x_final = X[-1]
+
+            if constraints.match_position:
+                residuals.append(x_final[0:3] - deck['pos'])
+
+            if constraints.match_velocity:
+                residuals.append(x_final[3:6] - deck['vel'])
+
+            if constraints.match_roll:
+                residuals.append(np.array([x_final[6] - deck['att'][0]]))
+
+            if constraints.match_pitch:
+                residuals.append(np.array([x_final[7] - deck['att'][1]]))
+
+            if constraints.zero_thrust:
+                residuals.append(np.array([U[-1, 0]]))
+
+            return np.concatenate(residuals)
+
+        # Inequality constraints for deck attitude at landing
+        def ineq_constraints(z):
+            """Inequality constraints g(z) >= 0"""
+            X, U, tf = self.unpack_decision_vars(z)
+            deck = get_deck_state_at_tf(tf)
+
+            ineqs = []
+
+            # |roll| <= max_roll => max_roll - |roll| >= 0
+            ineqs.append(max_roll - abs(deck['att'][0]))
+            # |pitch| <= max_pitch => max_pitch - |pitch| >= 0
+            ineqs.append(max_pitch - abs(deck['att'][1]))
+
+            # deck moving down: heave_vel >= 0 in NED
+            if require_descending:
+                ineqs.append(deck['vel'][2])  # Should be >= 0
+
+            return np.array(ineqs)
+
+        # Find a good initial tf that satisfies touchdown constraints
+        tf_guess = (tf_min + tf_max) / 2
+        best_tf = tf_guess
+        best_violation = float('inf')
+
+        # Search for a valid landing window
+        for tf_search in np.linspace(tf_min, tf_max, 20):
+            deck = get_deck_state_at_tf(tf_search)
+            roll_ok = abs(deck['att'][0]) <= max_roll
+            pitch_ok = abs(deck['att'][1]) <= max_pitch
+            descend_ok = deck['vel'][2] >= 0 if require_descending else True
+
+            if roll_ok and pitch_ok and descend_ok:
+                tf_guess = tf_search
+                break
+
+            violation = 0
+            if not roll_ok:
+                violation += (abs(deck['att'][0]) - max_roll)**2
+            if not pitch_ok:
+                violation += (abs(deck['att'][1]) - max_pitch)**2
+            if not descend_ok:
+                violation += deck['vel'][2]**2
+
+            if violation < best_violation:
+                best_violation = violation
+                best_tf = tf_search
+
+        if tf_guess == (tf_min + tf_max) / 2:
+            tf_guess = best_tf  # Use best even if not perfect
+
+        if verbose:
+            deck = get_deck_state_at_tf(tf_guess)
+            print(f"Initial tf guess: {tf_guess:.2f}s")
+            print(f"  Deck roll: {np.degrees(deck['att'][0]):.1f}°")
+            print(f"  Deck pitch: {np.degrees(deck['att'][1]):.1f}°")
+            print(f"  Deck heave vel: {deck['vel'][2]:.2f} m/s")
+
+        # Initial guess for trajectory
+        deck = get_deck_state_at_tf(tf_guess)
+        X_guess = np.zeros((N, nx))
+        U_guess = np.zeros((N, nu))
+
+        for i in range(N):
+            alpha = (self.tau[i] + 1) / 2
+            X_guess[i, 0:3] = (1 - alpha) * x_init[0:3] + alpha * deck['pos']
+            X_guess[i, 3:6] = (1 - alpha) * x_init[3:6] + alpha * deck['vel']
+            X_guess[i, 6:9] = (1 - alpha) * x_init[6:9] + alpha * deck['att']
+            U_guess[i, 0] = self.params.mass * self.g * (1 - alpha)
+
+        z0 = self.pack_decision_vars(X_guess, U_guess, tf_guess)
+
+        # Bounds
+        lb, ub = self.bounds(x_init, tf_min=tf_min, tf_max=tf_max)
+
+        # Scale for better conditioning
+        def scaled_obj(z):
+            return objective(z) * 0.01
+
+        def scaled_eq(z):
+            return eq_constraints(z) * 0.1
+
+        # Solve with SLSQP (supports eq + ineq)
+        cons = [
+            {'type': 'eq', 'fun': scaled_eq},
+            {'type': 'ineq', 'fun': ineq_constraints}
+        ]
+
+        result = minimize(
+            scaled_obj,
+            z0,
+            method='SLSQP',
+            bounds=list(zip(lb, ub)),
+            constraints=cons,
+            options={'maxiter': 100, 'ftol': 1e-4, 'disp': verbose}
+        )
+
+        # Extract solution
+        X, U, tf = self.unpack_decision_vars(result.x)
+        deck = get_deck_state_at_tf(tf)
+        deck_state = np.concatenate([deck['pos'], deck['vel'], deck['att']])
+
+        # Convert tau to physical time
+        t = (self.tau + 1) / 2 * tf
+
+        # Terminal errors
+        x_final = X[-1]
+        pos_error = x_final[0:3] - deck['pos']
+        vel_error = x_final[3:6] - deck['vel']
+        att_error = x_final[6:9] - deck['att']
+
+        # Check constraint satisfaction
+        eq_violation = np.linalg.norm(eq_constraints(result.x))
+        ineq_sat = np.all(ineq_constraints(result.x) >= -1e-3)
+
+        success = eq_violation < 0.5 and ineq_sat
+
+        if verbose:
+            print(f"\nFree-time solution: tf = {tf:.2f}s (t_land = {t_current + tf:.2f}s)")
+            print(f"  Deck at landing:")
+            print(f"    Roll: {np.degrees(deck['att'][0]):.2f}° (limit ±{np.degrees(max_roll):.0f}°)")
+            print(f"    Pitch: {np.degrees(deck['att'][1]):.2f}° (limit ±{np.degrees(max_pitch):.0f}°)")
+            print(f"    Heave vel: {deck['vel'][2]:.2f} m/s {'(descending)' if deck['vel'][2] >= 0 else '(ASCENDING!)'}")
+            print(f"  Terminal errors: pos={np.linalg.norm(pos_error):.3f}m, vel={np.linalg.norm(vel_error):.3f}m/s")
+            print(f"  Constraint violation: {eq_violation:.4f}")
+            print(f"  Success: {success}")
+
+        return {
+            'success': success,
+            'message': result.message,
+            'tf': tf,
+            't_landing': t_current + tf,
+            't': t,
+            'X': X,
+            'U': U,
+            'deck_state': deck_state,
+            'deck_att_at_landing': deck['att'],
+            'deck_vel_at_landing': deck['vel'],
+            'pos_error': pos_error,
+            'vel_error': vel_error,
+            'att_error': att_error,
+            'final_thrust': U[-1, 0],
+            'cost': result.fun / 0.01,
+            'constraint_violation': eq_violation
+        }
+
 
 def solve_landing(quad_pos: np.ndarray,
                   quad_vel: np.ndarray,

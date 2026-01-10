@@ -195,12 +195,23 @@ class PMPController:
             return self._fallback_control(x_current, deck_pos, deck_vel, deck_att)
 
         # === POSITION/VELOCITY TRACKING ===
-        # Compute desired acceleration to track reference trajectory
+        # Blend trajectory reference with current deck prediction
+        # As we get closer to landing, weight current deck more heavily
 
         pos_ref = x_ref[0:3]
         vel_ref = x_ref[3:6]
         pos_cur = x_current[0:3]
         vel_cur = x_current[3:6]
+
+        # Calculate distance to deck for blending
+        dist_to_deck = np.linalg.norm(deck_pos - pos_cur)
+
+        # Time remaining in trajectory
+        t_rel = t - self.trajectory_start_time
+        t_remain = max(0.5, self.trajectory.tf - t_rel)
+
+        # Use trajectory reference directly
+        # The trajectory already targets the predicted deck position
 
         pos_error = pos_cur - pos_ref
         vel_error = vel_cur - vel_ref

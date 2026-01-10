@@ -39,15 +39,15 @@ class LandingConfig:
     wave_direction: float = 45.0
 
     # Approach parameters
-    approach_altitude: float = 30.0
-    approach_distance: float = 50.0
-    approach_speed: float = 10.0
+    approach_altitude: float = 25.0
+    approach_distance: float = 40.0
+    approach_speed: float = 6.0          # Slower approach for prediction accuracy
 
     # ARMA prediction
     arma_fit_interval: float = 5.0      # Refit ARMA every 5s
     arma_history_length: float = 30.0    # Use 30s of past data
     prediction_dt: float = 0.5           # Predict at 0.5s increments
-    prediction_horizon: float = 5.0      # Predict up to 5s ahead
+    prediction_horizon: float = 10.0     # Predict up to 10s ahead for longer approaches
 
     # Trajectory replanning
     replan_interval: float = 0.5        # Replan every 0.5s
@@ -468,35 +468,66 @@ class LandingSimulator:
         else:
             t_horizontal = horiz_dist / 5.0
 
-        # Intercept time
-        t_intercept = max(t_vertical, t_horizontal, 2.0)
-        t_intercept = min(t_intercept, self.config.prediction_horizon)
+        # Intercept time estimate - ensure enough time for smooth approach
+        # Calculate based on 3D distance and comfortable approach speed
+        dist_3d = np.sqrt(horiz_dist**2 + height**2)
 
-        # Get ARMA prediction at intercept time
+        # Use consistent approach speed for intercept calculation
+        approach_speed = 6.0  # m/s net closing rate
+        t_direct = dist_3d / approach_speed
+
+        # Clamp intercept time to reasonable range
+        t_intercept = np.clip(t_direct, 3.0, 8.0)
+
+        # Get ARMA predictions covering the intercept window
         predictions = self.predictor.predict(self.t, t_intercept + 1.0, self.config.prediction_dt)
 
         if not predictions:
             return
 
-        # Find best touchdown window in predictions
+        # Find prediction closest to intercept time with good touchdown conditions
         best_pred = None
-        for pred in predictions:
-            if pred.t - self.t >= t_intercept - 0.3:
-                deck_level = (abs(np.degrees(pred.attitude[0])) < self.config.max_deck_roll_deg and
-                             abs(np.degrees(pred.attitude[1])) < self.config.max_deck_pitch_deg)
-                deck_descending = pred.velocity[2] > 0 if self.config.deck_moving_down else True
+        best_time_diff = float('inf')
 
-                if deck_level and deck_descending:
+        for pred in predictions:
+            time_to_pred = pred.t - self.t
+
+            # Check touchdown window conditions
+            deck_level = (abs(np.degrees(pred.attitude[0])) < self.config.max_deck_roll_deg and
+                         abs(np.degrees(pred.attitude[1])) < self.config.max_deck_pitch_deg)
+            deck_descending = pred.velocity[2] > 0 if self.config.deck_moving_down else True
+
+            # Prefer predictions close to intercept time
+            time_diff = abs(time_to_pred - t_intercept)
+
+            if time_diff < best_time_diff:
+                # Accept if in good window, or if no good window found yet
+                if (deck_level and deck_descending) or best_pred is None:
                     best_pred = pred
-                    break
-                elif best_pred is None:
-                    best_pred = pred
+                    best_time_diff = time_diff
+
+                    # If this is a good window close to intercept, use it
+                    if deck_level and deck_descending and time_diff < 0.5:
+                        break
 
         if best_pred is None:
-            best_pred = predictions[-1]
+            best_pred = predictions[min(int(t_intercept / self.config.prediction_dt), len(predictions)-1)]
+
+        # Ensure minimum trajectory time for smooth approach
+        time_to_pred = best_pred.t - self.t
+        tf_actual = max(3.0, time_to_pred)
+
+        # If we extended the time, find a prediction at that time instead
+        if tf_actual > time_to_pred + 0.3:
+            # Find prediction closest to tf_actual from now
+            target_time = self.t + tf_actual
+            for pred in predictions:
+                if abs(pred.t - target_time) < abs(best_pred.t - target_time):
+                    best_pred = pred
 
         self.target_deck_state = best_pred
-        tf_actual = max(1.5, best_pred.t - self.t)
+        # Recalculate tf_actual to match the prediction we're actually using
+        tf_actual = max(2.5, best_pred.t - self.t)
 
         if self.use_pmp:
             # Use min-snap for speed, but create PMPTrajectory with costates
@@ -953,7 +984,7 @@ class LandingSimulator:
 
         self.t += dt
 
-        # Replan periodically
+        # Replan at fixed interval
         if int(self.t / self.config.replan_interval) > int((self.t - dt) / self.config.replan_interval):
             self._replan()
 

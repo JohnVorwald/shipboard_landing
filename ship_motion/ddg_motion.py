@@ -540,6 +540,306 @@ class ARMAPredictor:
         return mean, covariance
 
 
+class WaveEstimatorPredictor:
+    """
+    Physics-based predictor using wave estimation.
+
+    Instead of ARMA on motion directly, this:
+    1. Estimates wave components (amplitude, phase) from observed motion
+    2. Uses ship RAOs to invert motion -> wave forcing
+    3. Propagates wave model forward in time
+    4. Predicts future motion using ship transfer functions
+
+    This leverages known physics (waves are sinusoidal, ship is linear system)
+    for more accurate long-horizon prediction.
+    """
+
+    def __init__(self, ship: DDGParams, sea_state: SeaState,
+                 n_wave_components: int = 15, ship_speed_kts: float = 15.0):
+        """
+        Args:
+            ship: Ship parameters (for RAOs)
+            sea_state: Sea state (for wave spectrum)
+            n_wave_components: Number of wave frequency components to estimate
+            ship_speed_kts: Ship speed for encounter frequency
+        """
+        self.ship = ship
+        self.sea_state = sea_state
+        self.ship_speed = ship_speed_kts * 0.5144
+        self.n_components = n_wave_components
+        self.g = 9.81
+
+        # Wave spectrum for prior on frequencies
+        self.spectrum = WaveSpectrum(sea_state.Hs, sea_state.Tp)
+
+        # Generate candidate wave frequencies based on spectrum
+        omega_peak = 2 * np.pi / sea_state.Tp
+        self.omega = np.linspace(0.3 * omega_peak, 2.5 * omega_peak, n_wave_components)
+
+        # Encounter frequencies
+        mu = np.radians(sea_state.direction)
+        self.omega_e = self.omega - (self.omega**2 * self.ship_speed / self.g) * np.cos(mu)
+        self.omega_e = np.maximum(self.omega_e, 0.05)
+
+        # Compute RAOs at these frequencies
+        self._compute_raos()
+
+        # Estimated wave amplitudes and phases (to be fitted)
+        self.wave_amp = np.zeros(n_wave_components)
+        self.wave_phase = np.zeros(n_wave_components)
+
+        # History for fitting
+        self.t_history = []
+        self.motion_history = []  # [roll, pitch, heave]
+
+        self.fitted = False
+        self.last_fit_time = 0
+
+    def _compute_raos(self):
+        """Compute ship RAOs at wave frequencies."""
+        ship = self.ship
+        omega = self.omega_e
+
+        wn_roll = 2 * np.pi / ship.T_roll
+        wn_pitch = 2 * np.pi / ship.T_pitch
+        wn_heave = 2 * np.pi / ship.T_heave
+
+        def rao_complex(omega, wn, zeta, gain):
+            """Complex RAO: H(ω) = gain / (1 - (ω/ωn)² + 2jζω/ωn)"""
+            r = omega / wn
+            denom = (1 - r**2) + 2j * zeta * r
+            # Prevent singularity
+            denom = np.where(np.abs(denom) < 0.1, 0.1 * np.exp(1j * np.angle(denom)), denom)
+            return gain / denom
+
+        mu = np.radians(self.sea_state.direction)
+
+        # Roll RAO (beam seas excitation)
+        roll_gain = np.abs(np.sin(mu)) * 0.08
+        self.rao_roll = rao_complex(omega, wn_roll, ship.zeta_roll, roll_gain)
+
+        # Pitch RAO (head seas excitation)
+        pitch_gain = np.abs(np.cos(mu)) * 0.03
+        self.rao_pitch = rao_complex(omega, wn_pitch, ship.zeta_pitch, pitch_gain)
+
+        # Heave RAO
+        heave_gain = 0.8
+        self.rao_heave = rao_complex(omega, wn_heave, ship.zeta_heave, heave_gain)
+
+    def add_observation(self, t: float, roll: float, pitch: float, heave: float):
+        """
+        Add motion observation.
+
+        Args:
+            t: Time of observation
+            roll: Roll angle (rad)
+            pitch: Pitch angle (rad)
+            heave: Heave displacement (m, positive down)
+        """
+        self.t_history.append(t)
+        self.motion_history.append([roll, pitch, heave])
+
+        # Keep limited history (30s)
+        while len(self.t_history) > 1 and self.t_history[-1] - self.t_history[0] > 30.0:
+            self.t_history.pop(0)
+            self.motion_history.pop(0)
+
+    def fit(self, refit_interval: float = 2.0):
+        """
+        Estimate wave components from observed motion.
+
+        Uses least squares to find wave amplitudes and phases that
+        best explain the observed roll, pitch, heave through the RAOs.
+        """
+        if len(self.t_history) < 20:
+            return False
+
+        t_now = self.t_history[-1]
+        if self.fitted and t_now - self.last_fit_time < refit_interval:
+            return True  # Don't refit too often
+
+        # Convert to arrays
+        t = np.array(self.t_history)
+        motion = np.array(self.motion_history)  # (N, 3): roll, pitch, heave
+
+        N = len(t)
+        n_comp = self.n_components
+
+        # Build design matrix: motion = sum_i [a_i * cos(ωe_i * t) + b_i * sin(ωe_i * t)] * RAO
+        # For each motion channel and wave component
+
+        # We have 3 motions (roll, pitch, heave) and n_comp wave components
+        # Each wave component contributes: Re[RAO * A * exp(j(ωe*t + φ))]
+        #                                = |RAO| * A * cos(ωe*t + φ + angle(RAO))
+        # Using trig identity: A*cos(ωt + φ) = a*cos(ωt) + b*sin(ωt) where a=A*cos(φ), b=-A*sin(φ)
+
+        # Design matrix: 2 unknowns per wave component (a_i, b_i)
+        X = np.zeros((3 * N, 2 * n_comp))
+        y = np.zeros(3 * N)
+
+        for i, (rao, motion_idx) in enumerate([
+            (self.rao_roll, 0),
+            (self.rao_pitch, 1),
+            (self.rao_heave, 2)
+        ]):
+            for k in range(n_comp):
+                rao_mag = np.abs(rao[k])
+                rao_ang = np.angle(rao[k])
+
+                # a_k contribution: rao_mag * cos(ωe*t + rao_ang)
+                #                 = rao_mag * [cos(ωe*t)*cos(rao_ang) - sin(ωe*t)*sin(rao_ang)]
+                # b_k contribution: -rao_mag * sin(ωe*t + rao_ang)  (from sin wave)
+                #                 = -rao_mag * [sin(ωe*t)*cos(rao_ang) + cos(ωe*t)*sin(rao_ang)]
+
+                cos_wt = np.cos(self.omega_e[k] * t)
+                sin_wt = np.sin(self.omega_e[k] * t)
+
+                # For a_k (cosine coefficient of wave)
+                X[i*N:(i+1)*N, 2*k] = rao_mag * (cos_wt * np.cos(rao_ang) - sin_wt * np.sin(rao_ang))
+                # For b_k (sine coefficient of wave)
+                X[i*N:(i+1)*N, 2*k+1] = -rao_mag * (sin_wt * np.cos(rao_ang) + cos_wt * np.sin(rao_ang))
+
+            y[i*N:(i+1)*N] = motion[:, motion_idx]
+
+        # Solve with ridge regression for stability
+        ridge = 0.01 * np.eye(2 * n_comp)
+        XtX = X.T @ X + ridge
+        Xty = X.T @ y
+
+        try:
+            coeffs = np.linalg.solve(XtX, Xty)
+        except np.linalg.LinAlgError:
+            coeffs = np.linalg.lstsq(XtX, Xty, rcond=None)[0]
+
+        # Extract wave amplitudes and phases
+        # a_k = A*cos(φ), b_k = -A*sin(φ)
+        # A = sqrt(a² + b²), φ = atan2(-b, a)
+        for k in range(n_comp):
+            a_k = coeffs[2*k]
+            b_k = coeffs[2*k + 1]
+            self.wave_amp[k] = np.sqrt(a_k**2 + b_k**2)
+            self.wave_phase[k] = np.arctan2(-b_k, a_k)
+
+        self.fitted = True
+        self.last_fit_time = t_now
+        return True
+
+    def predict_motion(self, t_predict: float) -> dict:
+        """
+        Predict ship motion at future time using estimated waves.
+
+        Args:
+            t_predict: Time to predict motion at
+
+        Returns:
+            Dict with roll, pitch, heave, and rates
+        """
+        if not self.fitted:
+            # Return zeros if not fitted
+            return {
+                'roll': 0, 'pitch': 0, 'heave': 0,
+                'roll_rate': 0, 'pitch_rate': 0, 'heave_rate': 0
+            }
+
+        # Compute motion as superposition of wave components through RAOs
+        roll = 0
+        pitch = 0
+        heave = 0
+        roll_rate = 0
+        pitch_rate = 0
+        heave_rate = 0
+
+        for k in range(self.n_components):
+            A = self.wave_amp[k]
+            phi = self.wave_phase[k]
+            omega_e = self.omega_e[k]
+
+            # Wave elevation at time t
+            wave_cos = A * np.cos(omega_e * t_predict + phi)
+            wave_sin = A * np.sin(omega_e * t_predict + phi)
+
+            # Motion = Re[RAO * wave]
+            roll += np.abs(self.rao_roll[k]) * A * np.cos(omega_e * t_predict + phi + np.angle(self.rao_roll[k]))
+            pitch += np.abs(self.rao_pitch[k]) * A * np.cos(omega_e * t_predict + phi + np.angle(self.rao_pitch[k]))
+            heave += np.abs(self.rao_heave[k]) * A * np.cos(omega_e * t_predict + phi + np.angle(self.rao_heave[k]))
+
+            # Rates (derivative of cos is -ω*sin)
+            roll_rate += -omega_e * np.abs(self.rao_roll[k]) * A * np.sin(omega_e * t_predict + phi + np.angle(self.rao_roll[k]))
+            pitch_rate += -omega_e * np.abs(self.rao_pitch[k]) * A * np.sin(omega_e * t_predict + phi + np.angle(self.rao_pitch[k]))
+            heave_rate += -omega_e * np.abs(self.rao_heave[k]) * A * np.sin(omega_e * t_predict + phi + np.angle(self.rao_heave[k]))
+
+        return {
+            'roll': roll,
+            'pitch': pitch,
+            'heave': heave,
+            'roll_rate': roll_rate,
+            'pitch_rate': pitch_rate,
+            'heave_rate': heave_rate
+        }
+
+    def predict_deck_state(self, t_predict: float, ship_sim: 'DDGMotionSimulator') -> dict:
+        """
+        Predict full deck state at future time.
+
+        Combines wave-based prediction for oscillatory motion with
+        constant-velocity prediction for ship translation.
+
+        Args:
+            t_predict: Time to predict
+            ship_sim: Ship simulator for deck geometry
+
+        Returns:
+            Dict with deck_position, deck_velocity, attitude
+        """
+        # Get wave-induced motion prediction
+        motion = self.predict_motion(t_predict)
+
+        # Ship translation (constant velocity)
+        # Use current position + velocity * dt
+        t_current = self.t_history[-1] if self.t_history else 0
+        dt = t_predict - t_current
+
+        # Base position from ship (constant velocity assumption)
+        current_motion = ship_sim.get_motion(t_current)
+        base_pos = current_motion['position']
+        base_vel = current_motion['velocity']
+
+        # Predicted ship position (translation only)
+        pred_ship_pos = base_pos + base_vel * dt
+
+        # Add oscillatory deck motion due to roll/pitch/heave
+        # Deck position in body frame
+        deck_body = np.array([ship_sim.ship.deck_x, ship_sim.ship.deck_y, ship_sim.ship.deck_z])
+
+        # Rotation from predicted roll/pitch
+        roll = motion['roll']
+        pitch = motion['pitch']
+
+        cr, sr = np.cos(roll), np.sin(roll)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+
+        # Simple rotation (small angle approximation for deck offset)
+        deck_offset = np.array([
+            deck_body[0],
+            deck_body[1] + deck_body[2] * sr,  # Roll causes lateral motion
+            deck_body[2] * cr + deck_body[0] * sp + motion['heave']  # Pitch and heave
+        ])
+
+        deck_pos = pred_ship_pos + deck_offset
+
+        # Deck velocity
+        deck_vel = base_vel.copy()
+        deck_vel[1] += deck_body[2] * motion['roll_rate'] * cr  # Roll rate contribution
+        deck_vel[2] += motion['heave_rate']  # Heave rate
+
+        return {
+            'deck_position': deck_pos,
+            'deck_velocity': deck_vel,
+            'attitude': np.array([roll, pitch, 0]),
+            'angular_rate': np.array([motion['roll_rate'], motion['pitch_rate'], 0])
+        }
+
+
 def demo():
     """Demonstrate ship motion simulation and prediction."""
     print("DDG Ship Motion Simulation Demo")
