@@ -107,36 +107,97 @@ class TestTauGuidanceController:
 
 
 class TestZEMGuidance:
-    """Tests for Zero Effort Miss guidance (if implemented)."""
+    """Tests for Zero Effort Miss guidance."""
+
+    def test_zem_creation(self):
+        """Test ZEM guidance creation."""
+        from guidance.zem_guidance import ZEMGuidance, ZEMGuidanceConfig
+        config = ZEMGuidanceConfig()
+        zem = ZEMGuidance(config)
+        assert zem is not None
+        assert zem.config.N_position > 0
 
     def test_zem_computation(self):
         """Test ZEM guidance law."""
-        try:
-            from guidance.zem_guidance import ZEMGuidance
-            zem = ZEMGuidance()
+        from guidance.zem_guidance import ZEMGuidance
+        zem = ZEMGuidance()
 
-            # Position and velocity
-            pos = np.array([100.0, 0.0, -30.0])
-            vel = np.array([-5.0, 0.0, 2.0])
-            target = np.array([0.0, 0.0, 0.0])
+        # Position and velocity
+        pos = np.array([100.0, 0.0, -30.0])
+        vel = np.array([-5.0, 0.0, 2.0])
+        target = np.array([0.0, 0.0, 0.0])
 
-            accel = zem.compute_acceleration(pos, vel, target, t_go=10.0)
+        accel = zem.compute_acceleration(pos, vel, target, t_go=10.0)
 
-            assert len(accel) == 3
-            assert np.all(np.isfinite(accel))
-        except ImportError:
-            pytest.skip("ZEMGuidance not implemented")
+        assert len(accel) == 3
+        assert np.all(np.isfinite(accel))
+
+    def test_zem_control_interface(self):
+        """Test ZEM compute_control interface."""
+        from guidance.zem_guidance import ZEMGuidance
+        zem = ZEMGuidance()
+
+        pos = np.array([50.0, 10.0, -25.0])
+        vel = np.array([-3.0, -1.0, 1.5])
+        deck_pos = np.array([0.0, 0.0, -8.0])
+        deck_vel = np.array([7.7, 0.0, 0.0])
+
+        accel, info = zem.compute_control(pos, vel, deck_pos, deck_vel)
+
+        assert len(accel) == 3
+        assert 't_go' in info
+        assert 'zem' in info
+        assert info['t_go'] > 0
 
 
 class TestHigherOrderGuidance:
-    """Tests for higher-order tau guidance (if implemented)."""
+    """Tests for higher-order tau guidance."""
 
-    def test_second_order_tau(self):
-        """Test 2nd order tau guidance."""
-        try:
-            from guidance.higher_order_tau import SecondOrderTauGuidance
+    def test_second_order_tau_creation(self):
+        """Test 2nd order tau guidance creation."""
+        from guidance.higher_order_tau import SecondOrderTauGuidance, SecondOrderTauConfig
 
-            guidance = SecondOrderTauGuidance()
-            assert guidance is not None
-        except ImportError:
-            pytest.skip("SecondOrderTauGuidance not implemented")
+        config = SecondOrderTauConfig()
+        guidance = SecondOrderTauGuidance(config)
+        assert guidance is not None
+        assert guidance.config.tau_dot_approach > 0
+
+    def test_second_order_tau_compute(self):
+        """Test 2nd order tau guidance computation."""
+        from guidance.higher_order_tau import SecondOrderTauGuidance
+
+        guidance = SecondOrderTauGuidance()
+
+        pos = np.array([-40.0, 5.0, -25.0])
+        vel = np.array([6.0, -0.5, 2.0])
+        deck_pos = np.array([0.0, 0.0, -8.0])
+        deck_vel = np.array([7.7, 0.0, 0.0])
+
+        accel, info = guidance.compute_control(pos, vel, deck_pos, deck_vel, t=0.0)
+
+        assert len(accel) == 3
+        assert np.all(np.isfinite(accel))
+        assert 'tau_h' in info
+        assert 'tau_v' in info
+
+    def test_second_order_tau_tracks_derivative(self):
+        """Test that τ̇ is tracked over time."""
+        from guidance.higher_order_tau import SecondOrderTauGuidance
+
+        guidance = SecondOrderTauGuidance()
+
+        pos = np.array([-30.0, 0.0, -20.0])
+        vel = np.array([5.0, 0.0, 2.0])
+        deck_pos = np.array([0.0, 0.0, -8.0])
+        deck_vel = np.array([7.7, 0.0, 0.0])
+
+        # Run multiple steps
+        for i in range(10):
+            t = i * 0.1
+            accel, info = guidance.compute_control(pos, vel, deck_pos, deck_vel, t=t)
+            pos = pos + vel * 0.1
+            vel = vel + accel * 0.1
+
+        # τ̇ should have been updated
+        assert 'tau_dot_h' in info
+        assert 'tau_dot_v' in info

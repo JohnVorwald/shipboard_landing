@@ -266,6 +266,36 @@ class LandingTrajectoryPlanner:
         self.params = params if params is not None else QuadrotorParams()
         self.traj_gen = MinSnapTrajectory(self.params)
 
+    def plan(self, quad_state: dict, deck_state: dict, tf: float = None) -> dict:
+        """
+        Plan optimal landing trajectory with variable final time.
+
+        PMP goal: Match position, velocity, AND attitude at touchdown.
+        tf is treated as a free variable to be optimized.
+
+        Args:
+            quad_state: Current UAV state with 'position', 'velocity', optionally 'attitude'
+            deck_state: Target deck state with 'position', 'velocity', 'attitude'
+            tf: Optional fixed final time (optimized if None)
+
+        Returns:
+            Dictionary with trajectory and timing info
+        """
+        quad_pos = quad_state.get('position', np.zeros(3))
+        quad_vel = quad_state.get('velocity', np.zeros(3))
+        deck_pos = deck_state.get('position', np.zeros(3))
+        deck_vel = deck_state.get('velocity', np.zeros(3))
+        deck_att = deck_state.get('attitude', np.zeros(3))
+
+        return self.plan_landing(
+            quad_pos=quad_pos,
+            quad_vel=quad_vel,
+            deck_pos=deck_pos,
+            deck_vel=deck_vel,
+            deck_att=deck_att,
+            tf_desired=tf
+        )
+
     def plan_landing(self,
                      quad_pos: np.ndarray,
                      quad_vel: np.ndarray,

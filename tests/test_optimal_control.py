@@ -134,14 +134,43 @@ class TestTrajectoryPlanner:
         assert trajectory_planner is not None
 
     def test_plan_landing_trajectory(self, trajectory_planner):
-        """Test landing trajectory planning."""
-        # LandingTrajectoryPlanner doesn't have plan() method
-        pytest.skip("LandingTrajectoryPlanner.plan() not in API")
+        """Test landing trajectory planning with variable tf."""
+        quad_state = {
+            'position': np.array([50.0, 10.0, -25.0]),
+            'velocity': np.array([-5.0, -1.0, 2.0])
+        }
+        deck_state = {
+            'position': np.array([0.0, 0.0, -8.0]),
+            'velocity': np.array([7.7, 0.0, 0.0]),
+            'attitude': np.array([0.05, 0.02, 0.0])
+        }
+
+        result = trajectory_planner.plan(quad_state, deck_state)
+
+        assert 'success' in result
+        assert 'tf' in result
+        if result['success']:
+            assert result['tf'] > 0
 
     def test_trajectory_constraints(self, trajectory_planner):
         """Test trajectory respects constraints."""
-        # LandingTrajectoryPlanner doesn't have plan() method
-        pytest.skip("LandingTrajectoryPlanner.plan() not in API")
+        quad_state = {
+            'position': np.array([-30.0, 0.0, -20.0]),
+            'velocity': np.array([5.0, 0.0, 2.0])
+        }
+        deck_state = {
+            'position': np.array([0.0, 0.0, -8.0]),
+            'velocity': np.array([7.7, 0.0, 0.0]),
+            'attitude': np.zeros(3)
+        }
+
+        result = trajectory_planner.plan(quad_state, deck_state)
+
+        if result['success'] and 'validation' in result:
+            validation = result['validation']
+            # Check thrust is bounded
+            if 'max_thrust' in validation:
+                assert validation['max_thrust'] < 50  # Reasonable max thrust
 
 
 class TestVariableHorizonMPC:
