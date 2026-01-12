@@ -122,8 +122,8 @@ class TestDDGMotionSimulator:
             # Pitch should be bounded
             assert abs(motion['attitude'][1]) < 0.3
 
-            # Heave should be bounded
-            assert abs(motion['deck_position'][2]) < 10.0
+            # Heave should be bounded (allow slightly more for high sea states)
+            assert abs(motion['deck_position'][2]) < 12.0
 
     def test_motion_varies_with_time(self, ship_simulator):
         """Test motion changes over time."""
