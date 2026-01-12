@@ -1,0 +1,297 @@
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <model name="quadrotor">
+    <pose>0 0 0 0 0 0</pose>
+
+    <link name="base_link">
+      <inertial>
+        <mass>2.0</mass>
+        <inertia>
+          <ixx>0.02</ixx>
+          <iyy>0.02</iyy>
+          <izz>0.04</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+
+      <collision name="body_collision">
+        <geometry>
+          <box>
+            <size>0.4 0.4 0.15</size>
+          </box>
+        </geometry>
+      </collision>
+
+      <!-- Main body -->
+      <visual name="body_visual">
+        <geometry>
+          <box>
+            <size>0.25 0.25 0.1</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.2 0.2 0.2 1</ambient>
+          <diffuse>0.3 0.3 0.3 1</diffuse>
+        </material>
+      </visual>
+
+      <!-- Arms -->
+      <visual name="arm_front_right">
+        <pose>0.15 -0.15 0 0 0 0.785</pose>
+        <geometry>
+          <box>
+            <size>0.25 0.03 0.02</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 1</ambient>
+          <diffuse>0.2 0.2 0.2 1</diffuse>
+        </material>
+      </visual>
+
+      <visual name="arm_front_left">
+        <pose>0.15 0.15 0 0 0 -0.785</pose>
+        <geometry>
+          <box>
+            <size>0.25 0.03 0.02</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 1</ambient>
+          <diffuse>0.2 0.2 0.2 1</diffuse>
+        </material>
+      </visual>
+
+      <visual name="arm_back_right">
+        <pose>-0.15 -0.15 0 0 0 -0.785</pose>
+        <geometry>
+          <box>
+            <size>0.25 0.03 0.02</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 1</ambient>
+          <diffuse>0.2 0.2 0.2 1</diffuse>
+        </material>
+      </visual>
+
+      <visual name="arm_back_left">
+        <pose>-0.15 0.15 0 0 0 0.785</pose>
+        <geometry>
+          <box>
+            <size>0.25 0.03 0.02</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 1</ambient>
+          <diffuse>0.2 0.2 0.2 1</diffuse>
+        </material>
+      </visual>
+
+      <!-- Motors -->
+      <visual name="motor_front_right">
+        <pose>0.2 -0.2 0.02 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.03</radius>
+            <length>0.04</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.8 0.1 0.1 1</ambient>
+          <diffuse>0.9 0.2 0.2 1</diffuse>
+        </material>
+      </visual>
+
+      <visual name="motor_front_left">
+        <pose>0.2 0.2 0.02 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.03</radius>
+            <length>0.04</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.1 0.8 0.1 1</ambient>
+          <diffuse>0.2 0.9 0.2 1</diffuse>
+        </material>
+      </visual>
+
+      <visual name="motor_back_right">
+        <pose>-0.2 -0.2 0.02 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.03</radius>
+            <length>0.04</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.8 1</ambient>
+          <diffuse>0.2 0.2 0.9 1</diffuse>
+        </material>
+      </visual>
+
+      <visual name="motor_back_left">
+        <pose>-0.2 0.2 0.02 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.03</radius>
+            <length>0.04</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.8 0.8 0.1 1</ambient>
+          <diffuse>0.9 0.9 0.2 1</diffuse>
+        </material>
+      </visual>
+
+      <!-- Propellers (visual only) -->
+      <visual name="prop_front_right">
+        <pose>0.2 -0.2 0.05 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.12</radius>
+            <length>0.005</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 0.5</ambient>
+          <diffuse>0.2 0.2 0.2 0.5</diffuse>
+        </material>
+      </visual>
+
+      <visual name="prop_front_left">
+        <pose>0.2 0.2 0.05 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.12</radius>
+            <length>0.005</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 0.5</ambient>
+          <diffuse>0.2 0.2 0.2 0.5</diffuse>
+        </material>
+      </visual>
+
+      <visual name="prop_back_right">
+        <pose>-0.2 -0.2 0.05 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.12</radius>
+            <length>0.005</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 0.5</ambient>
+          <diffuse>0.2 0.2 0.2 0.5</diffuse>
+        </material>
+      </visual>
+
+      <visual name="prop_back_left">
+        <pose>-0.2 0.2 0.05 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.12</radius>
+            <length>0.005</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 0.5</ambient>
+          <diffuse>0.2 0.2 0.2 0.5</diffuse>
+        </material>
+      </visual>
+
+      <!-- Landing gear -->
+      <visual name="landing_gear_fl">
+        <pose>0.12 0.12 -0.08 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.01</radius>
+            <length>0.12</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 1</ambient>
+          <diffuse>0.2 0.2 0.2 1</diffuse>
+        </material>
+      </visual>
+
+      <visual name="landing_gear_fr">
+        <pose>0.12 -0.12 -0.08 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.01</radius>
+            <length>0.12</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 1</ambient>
+          <diffuse>0.2 0.2 0.2 1</diffuse>
+        </material>
+      </visual>
+
+      <visual name="landing_gear_bl">
+        <pose>-0.12 0.12 -0.08 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.01</radius>
+            <length>0.12</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 1</ambient>
+          <diffuse>0.2 0.2 0.2 1</diffuse>
+        </material>
+      </visual>
+
+      <visual name="landing_gear_br">
+        <pose>-0.12 -0.12 -0.08 0 0 0</pose>
+        <geometry>
+          <cylinder>
+            <radius>0.01</radius>
+            <length>0.12</length>
+          </cylinder>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 1</ambient>
+          <diffuse>0.2 0.2 0.2 1</diffuse>
+        </material>
+      </visual>
+
+      <!-- IMU sensor -->
+      <sensor name="imu" type="imu">
+        <always_on>true</always_on>
+        <update_rate>200</update_rate>
+        <imu>
+          <angular_velocity>
+            <x><noise type="gaussian"><mean>0</mean><stddev>0.001</stddev></noise></x>
+            <y><noise type="gaussian"><mean>0</mean><stddev>0.001</stddev></noise></y>
+            <z><noise type="gaussian"><mean>0</mean><stddev>0.001</stddev></noise></z>
+          </angular_velocity>
+          <linear_acceleration>
+            <x><noise type="gaussian"><mean>0</mean><stddev>0.01</stddev></noise></x>
+            <y><noise type="gaussian"><mean>0</mean><stddev>0.01</stddev></noise></y>
+            <z><noise type="gaussian"><mean>0</mean><stddev>0.01</stddev></noise></z>
+          </linear_acceleration>
+        </imu>
+      </sensor>
+
+    </link>
+
+    <!-- Controller plugin with optimal control -->
+    <plugin name="quadrotor_controller" filename="libquadrotor_controller_plugin.so">
+      <mass>2.0</mass>
+      <target_model>ship</target_model>
+      <deck_offset>15 0 2.2</deck_offset>
+      <use_optimal_control>true</use_optimal_control>
+      <kp_pos>6.0</kp_pos>
+      <kd_pos>4.0</kd_pos>
+      <kp_att>200.0</kp_att>
+      <kd_att>30.0</kd_att>
+    </plugin>
+
+  </model>
+</sdf>
