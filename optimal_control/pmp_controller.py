@@ -476,6 +476,203 @@ def create_pmp_trajectory(x_traj: np.ndarray, u_traj: np.ndarray,
     )
 
 
+def extract_waypoints(trajectory: PMPTrajectory,
+                      interval: float = 0.5,
+                      frame: str = 'NED') -> List[dict]:
+    """
+    Extract waypoints from PMP trajectory for ArduPilot Guided mode.
+
+    Args:
+        trajectory: PMPTrajectory object
+        interval: Time interval between waypoints (seconds)
+        frame: Coordinate frame ('NED' or 'ENU')
+
+    Returns:
+        List of waypoint dictionaries with:
+            - time: Time along trajectory
+            - position: [x, y, z] in specified frame
+            - velocity: [vx, vy, vz] in specified frame
+            - yaw: Heading angle (rad)
+    """
+    waypoints = []
+    t_points = np.arange(0, trajectory.tf, interval)
+    if t_points[-1] < trajectory.tf:
+        t_points = np.append(t_points, trajectory.tf)
+
+    for t in t_points:
+        # Interpolate trajectory at this time
+        idx = np.searchsorted(trajectory.t, t)
+        if idx == 0:
+            x = trajectory.x[0]
+        elif idx >= len(trajectory.t):
+            x = trajectory.x[-1]
+        else:
+            t0, t1 = trajectory.t[idx-1], trajectory.t[idx]
+            alpha = (t - t0) / (t1 - t0) if t1 > t0 else 0
+            x = (1 - alpha) * trajectory.x[idx-1] + alpha * trajectory.x[idx]
+
+        pos = x[:3]
+        vel = x[3:6]
+        yaw = x[8]  # Attitude index 8 is yaw
+
+        # Convert frame if needed
+        if frame == 'ENU':
+            # NED to ENU: swap x<->y, negate z
+            pos = np.array([pos[1], pos[0], -pos[2]])
+            vel = np.array([vel[1], vel[0], -vel[2]])
+            yaw = np.pi/2 - yaw  # NED yaw to ENU heading
+
+        waypoints.append({
+            'time': t,
+            'position': pos.tolist(),
+            'velocity': vel.tolist(),
+            'yaw': float(yaw)
+        })
+
+    return waypoints
+
+
+def trajectory_to_mavlink_messages(trajectory: PMPTrajectory,
+                                   interval: float = 0.5,
+                                   coordinate_frame: int = 1,
+                                   origin_lat: float = 0.0,
+                                   origin_lon: float = 0.0,
+                                   origin_alt: float = 0.0) -> List[dict]:
+    """
+    Convert PMP trajectory to MAVLink SET_POSITION_TARGET_LOCAL_NED format.
+
+    This generates the message parameters that can be sent via pymavlink to
+    ArduPilot's Guided mode for trajectory following.
+
+    Args:
+        trajectory: PMPTrajectory object
+        interval: Time interval between commands (seconds)
+        coordinate_frame: MAVLink coordinate frame (1=LOCAL_NED, 7=LOCAL_ENU)
+        origin_lat: Origin latitude for global conversion (optional)
+        origin_lon: Origin longitude for global conversion (optional)
+        origin_alt: Origin altitude for global conversion (optional)
+
+    Returns:
+        List of MAVLink message parameter dictionaries:
+            - time_boot_ms: Timestamp (ms)
+            - coordinate_frame: MAV_FRAME
+            - type_mask: Bitmask for which fields to use
+            - x, y, z: Position (m)
+            - vx, vy, vz: Velocity (m/s)
+            - afx, afy, afz: Acceleration (m/s²) - set to 0
+            - yaw: Heading (rad)
+            - yaw_rate: Yaw rate (rad/s)
+    """
+    messages = []
+    t_points = np.arange(0, trajectory.tf, interval)
+    if t_points[-1] < trajectory.tf:
+        t_points = np.append(t_points, trajectory.tf)
+
+    # Type mask: use position (0x7) + velocity (0x38) + yaw (0x400)
+    # Ignore acceleration (0x1C0) and yaw_rate (0x800)
+    type_mask = 0x1C0 | 0x800  # Ignore accel and yaw_rate = use pos, vel, yaw
+
+    for i, t in enumerate(t_points):
+        # Interpolate trajectory
+        idx = np.searchsorted(trajectory.t, t)
+        if idx == 0:
+            x = trajectory.x[0]
+        elif idx >= len(trajectory.t):
+            x = trajectory.x[-1]
+        else:
+            t0, t1 = trajectory.t[idx-1], trajectory.t[idx]
+            alpha = (t - t0) / (t1 - t0) if t1 > t0 else 0
+            x = (1 - alpha) * trajectory.x[idx-1] + alpha * trajectory.x[idx]
+
+        msg = {
+            'time_boot_ms': int(t * 1000),
+            'coordinate_frame': coordinate_frame,
+            'type_mask': type_mask,
+            'x': float(x[0]),      # North position
+            'y': float(x[1]),      # East position
+            'z': float(x[2]),      # Down position (negative = up)
+            'vx': float(x[3]),     # North velocity
+            'vy': float(x[4]),     # East velocity
+            'vz': float(x[5]),     # Down velocity
+            'afx': 0.0,
+            'afy': 0.0,
+            'afz': 0.0,
+            'yaw': float(x[8]),    # Yaw angle
+            'yaw_rate': 0.0
+        }
+        messages.append(msg)
+
+    return messages
+
+
+def trajectory_to_mission_items(trajectory: PMPTrajectory,
+                                n_waypoints: int = 10,
+                                home_lat: float = 0.0,
+                                home_lon: float = 0.0,
+                                home_alt: float = 0.0) -> List[dict]:
+    """
+    Convert PMP trajectory to ArduPilot mission waypoint items.
+
+    Creates a mission that can be uploaded via MAVLink for AUTO mode.
+
+    Args:
+        trajectory: PMPTrajectory object
+        n_waypoints: Number of waypoints to generate
+        home_lat, home_lon, home_alt: Home position for coordinate conversion
+
+    Returns:
+        List of mission item dictionaries compatible with pymavlink:
+            - seq: Sequence number
+            - command: MAV_CMD (16 = NAV_WAYPOINT)
+            - frame: MAV_FRAME (3 = GLOBAL_RELATIVE_ALT)
+            - param1-4: Command parameters
+            - x, y, z: Position (lat, lon, alt)
+    """
+    items = []
+
+    # Sample trajectory at regular intervals
+    t_samples = np.linspace(0, trajectory.tf, n_waypoints)
+
+    for seq, t in enumerate(t_samples):
+        # Interpolate trajectory
+        idx = np.searchsorted(trajectory.t, t)
+        if idx == 0:
+            x = trajectory.x[0]
+        elif idx >= len(trajectory.t):
+            x = trajectory.x[-1]
+        else:
+            t0, t1 = trajectory.t[idx-1], trajectory.t[idx]
+            alpha = (t - t0) / (t1 - t0) if t1 > t0 else 0
+            x = (1 - alpha) * trajectory.x[idx-1] + alpha * trajectory.x[idx]
+
+        # Convert NED position to lat/lon (simple flat-earth approximation)
+        # More accurate conversion would use pyproj or navpy
+        METERS_PER_DEG_LAT = 111320.0
+        meters_per_deg_lon = 111320.0 * np.cos(np.radians(home_lat))
+
+        lat = home_lat + x[0] / METERS_PER_DEG_LAT
+        lon = home_lon + x[1] / max(meters_per_deg_lon, 1.0)
+        alt = home_alt - x[2]  # NED z is down, altitude is up
+
+        item = {
+            'seq': seq,
+            'command': 16,  # MAV_CMD_NAV_WAYPOINT
+            'frame': 3,     # MAV_FRAME_GLOBAL_RELATIVE_ALT
+            'current': 1 if seq == 0 else 0,
+            'autocontinue': 1,
+            'param1': 0.0,  # Hold time (s)
+            'param2': 1.0,  # Acceptance radius (m)
+            'param3': 0.0,  # Pass through (0 = stop at waypoint)
+            'param4': float(np.degrees(x[8])),  # Yaw angle (deg)
+            'x': lat,
+            'y': lon,
+            'z': alt
+        }
+        items.append(item)
+
+    return items
+
+
 def demo():
     """Demonstrate PMP controller."""
     print("PMP Controller Demo")
