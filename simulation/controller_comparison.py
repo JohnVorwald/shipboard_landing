@@ -27,6 +27,7 @@ from enum import Enum
 from quad_dynamics.quadrotor import QuadrotorParams, QuadrotorState
 from ship_motion.ddg_motion import DDGParams, SeaState, DDGMotionSimulator, ARMAPredictor
 from guidance.tau_guidance import TauGuidanceController, TauGuidanceConfig
+from guidance.navair_guidance import NAVAIRGuidance, NAVAIRConfig
 from optimal_control.trajectory_planner import LandingTrajectoryPlanner
 from optimal_control.pmp_controller import PMPController, create_pmp_trajectory, ControllerGains
 from optimal_control.variable_horizon_mpc import VariableHorizonMPC, VHMPCConfig
@@ -35,6 +36,7 @@ from optimal_control.variable_horizon_mpc import VariableHorizonMPC, VHMPCConfig
 class ControllerType(Enum):
     ZEM_ZEV = "ZEM/ZEV"
     TAU = "Tau-Based"
+    NAVAIR = "NAVAIR"
     VH_MPC = "VH-MPC"
     PMP = "PMP"
     PROP_NAV = "Prop Nav"
@@ -226,6 +228,41 @@ class TauController:
         return np.array([thrust, roll_cmd, pitch_cmd])
 
 
+class NAVAIRController:
+    """Wrapper for NAVAIR-style three-phase landing guidance."""
+
+    def __init__(self, params: QuadrotorParams):
+        self.params = params
+        config = NAVAIRConfig(
+            approach_altitude=15.0,
+            approach_speed=15.0,  # Must exceed ship speed (15kt = 7.7m/s)
+            glide_angle_deg=60.0,
+            glide_speed=6.0,
+            vertical_altitude=1.5,
+            glide_intercept_distance=15.0,
+            K_pos=3.0,
+            K_vel=6.0,
+            K_pos_terminal=6.0,
+            K_vel_terminal=10.0
+        )
+        self.navair = NAVAIRGuidance(config, params)
+        self.g = 9.81
+
+    def compute_control(self, state: QuadrotorState, deck_pos: np.ndarray,
+                       deck_vel: np.ndarray, deck_att: np.ndarray,
+                       t_go: float) -> np.ndarray:
+        """Compute control using NAVAIR guidance."""
+        acc_cmd, info = self.navair.compute_control(
+            state.pos, state.vel, deck_pos, deck_vel, deck_att
+        )
+
+        thrust, roll_cmd, pitch_cmd = self.navair.compute_thrust_attitude(
+            acc_cmd, state.yaw, deck_att, info['height']
+        )
+
+        return np.array([thrust, roll_cmd, pitch_cmd])
+
+
 class VHMPCController:
     """Wrapper for Variable Horizon MPC."""
 
@@ -355,6 +392,7 @@ class ControllerComparisonSim:
         self.controllers = {
             ControllerType.ZEM_ZEV: ZEMZEVController(self.quad_params),
             ControllerType.TAU: TauController(self.quad_params),
+            ControllerType.NAVAIR: NAVAIRController(self.quad_params),
             ControllerType.VH_MPC: VHMPCController(self.quad_params),
             ControllerType.PMP: PMPControllerWrapper(self.quad_params),
             ControllerType.PROP_NAV: PropNavController(self.quad_params),

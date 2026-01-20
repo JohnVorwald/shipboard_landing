@@ -10,6 +10,11 @@
       <render_engine>ogre</render_engine>
     </plugin>
 
+    <!-- Buoyancy system for ocean physics -->
+    <plugin filename="gz-sim-buoyancy-system" name="gz::sim::systems::Buoyancy">
+      <uniform_fluid_density>1025</uniform_fluid_density>
+    </plugin>
+
     <!-- Physics settings for stable simulation -->
     <physics name="default_physics" type="dart">
       <max_step_size>0.001</max_step_size>
@@ -58,8 +63,9 @@
           </inertia>
         </inertial>
 
-        <!-- Hull collision -->
+        <!-- Hull collision - offset to waterline -->
         <collision name="hull_collision">
+          <pose>0 0 -2 0 0 0</pose>
           <geometry>
             <box>
               <size>50 12 8</size>
@@ -244,6 +250,17 @@
         <deck_link>hull</deck_link>
         <deck_offset>15 0 2.2</deck_offset>
       </plugin>
+
+      <!-- Hydrodynamics disabled - needs asv_wave_sim rebuild
+      <plugin filename="gz-waves1-hydrodynamics-system" name="gz::sim::systems::Hydrodynamics">
+        <enable>ship::hull</enable>
+        <hydrodynamics>
+          <damping_on>1</damping_on>
+          <viscous_drag_on>1</viscous_drag_on>
+          <pressure_drag_on>1</pressure_drag_on>
+        </hydrodynamics>
+      </plugin>
+      -->
     </model>
 
     <!-- Quadrotor UAV -->

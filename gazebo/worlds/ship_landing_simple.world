@@ -1,0 +1,269 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <world name="ship_landing_simple">
+
+    <!-- Core system plugins -->
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre</render_engine>
+    </plugin>
+    <!-- Apply forces/torques to models -->
+    <plugin filename="gz-sim-apply-link-wrench-system" name="gz::sim::systems::ApplyLinkWrench"/>
+
+    <!-- Physics - smaller step size prevents tunneling -->
+    <physics name="default_physics" type="dart">
+      <max_step_size>0.0005</max_step_size>
+      <real_time_factor>1</real_time_factor>
+      <real_time_update_rate>2000</real_time_update_rate>
+    </physics>
+
+    <!-- Scene -->
+    <scene>
+      <ambient>0.6 0.6 0.7 1</ambient>
+      <background>0.4 0.5 0.6 1</background>
+      <shadows>true</shadows>
+    </scene>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 100 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.3 0.3 0.3 1</specular>
+      <direction>-0.5 0.3 -1</direction>
+    </light>
+
+    <!-- Ocean visual (static, no physics) -->
+    <model name="ocean">
+      <static>true</static>
+      <pose>0 0 -1 0 0 0</pose>
+      <link name="link">
+        <visual name="water">
+          <geometry>
+            <box><size>500 500 0.1</size></box>
+          </geometry>
+          <material>
+            <ambient>0.0 0.2 0.4 0.8</ambient>
+            <diffuse>0.0 0.3 0.6 0.8</diffuse>
+            <specular>0.4 0.4 0.4 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Ship (static for now - can add motion plugin later) -->
+    <model name="ship">
+      <static>true</static>
+      <pose>0 0 0 0 0 0</pose>
+      <link name="hull">
+        <!-- Main hull collision - full height -->
+        <collision name="hull_collision">
+          <pose>0 0 0 0 0 0</pose>
+          <geometry>
+            <box><size>50 12 6</size></box>
+          </geometry>
+        </collision>
+
+        <!-- Deck surface collision - thicker for reliability -->
+        <collision name="deck_collision">
+          <pose>0 0 3.5 0 0 0</pose>
+          <geometry>
+            <box><size>50 12 1</size></box>
+          </geometry>
+        </collision>
+
+        <!-- Helipad collision -->
+        <collision name="helipad_collision">
+          <pose>15 0 3.2 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>6</radius>
+              <length>0.5</length>
+            </cylinder>
+          </geometry>
+        </collision>
+
+        <!-- Hull visual -->
+        <visual name="hull_visual">
+          <pose>0 0 0 0 0 0</pose>
+          <geometry>
+            <box><size>50 12 6</size></box>
+          </geometry>
+          <material>
+            <ambient>0.3 0.3 0.35 1</ambient>
+            <diffuse>0.5 0.5 0.55 1</diffuse>
+          </material>
+        </visual>
+
+        <!-- Superstructure -->
+        <visual name="superstructure">
+          <pose>-10 0 6 0 0 0</pose>
+          <geometry>
+            <box><size>15 8 8</size></box>
+          </geometry>
+          <material>
+            <ambient>0.35 0.35 0.4 1</ambient>
+            <diffuse>0.55 0.55 0.6 1</diffuse>
+          </material>
+        </visual>
+
+        <!-- Helipad -->
+        <visual name="helipad">
+          <pose>15 0 3.1 0 0 0</pose>
+          <geometry>
+            <cylinder>
+              <radius>6</radius>
+              <length>0.2</length>
+            </cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1</ambient>
+            <diffuse>0.3 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+
+        <!-- Helipad H marking -->
+        <visual name="helipad_h">
+          <pose>15 0 3.21 0 0 0</pose>
+          <geometry>
+            <box><size>4 0.5 0.01</size></box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.9 0.2 1</ambient>
+            <diffuse>1.0 1.0 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Quadcopter - starts above and behind helipad for approach -->
+    <model name="quadcopter">
+      <pose>-20 0 15 0 0 0</pose>
+      <link name="base_link">
+        <inertial>
+          <mass>2.0</mass>
+          <inertia>
+            <ixx>0.02</ixx>
+            <iyy>0.02</iyy>
+            <izz>0.04</izz>
+          </inertia>
+        </inertial>
+
+        <collision name="body_collision">
+          <geometry>
+            <box><size>0.4 0.4 0.15</size></box>
+          </geometry>
+        </collision>
+
+        <!-- Bright orange body -->
+        <visual name="body">
+          <geometry>
+            <box><size>0.3 0.3 0.1</size></box>
+          </geometry>
+          <material>
+            <ambient>0.9 0.3 0.0 1</ambient>
+            <diffuse>1.0 0.4 0.0 1</diffuse>
+          </material>
+        </visual>
+
+        <!-- Arms -->
+        <visual name="arm_fr">
+          <pose>0.18 -0.18 0 0 0 0.785</pose>
+          <geometry><box><size>0.28 0.03 0.02</size></box></geometry>
+          <material><diffuse>0.2 0.2 0.2 1</diffuse></material>
+        </visual>
+        <visual name="arm_fl">
+          <pose>0.18 0.18 0 0 0 -0.785</pose>
+          <geometry><box><size>0.28 0.03 0.02</size></box></geometry>
+          <material><diffuse>0.2 0.2 0.2 1</diffuse></material>
+        </visual>
+        <visual name="arm_br">
+          <pose>-0.18 -0.18 0 0 0 -0.785</pose>
+          <geometry><box><size>0.28 0.03 0.02</size></box></geometry>
+          <material><diffuse>0.2 0.2 0.2 1</diffuse></material>
+        </visual>
+        <visual name="arm_bl">
+          <pose>-0.18 0.18 0 0 0 0.785</pose>
+          <geometry><box><size>0.28 0.03 0.02</size></box></geometry>
+          <material><diffuse>0.2 0.2 0.2 1</diffuse></material>
+        </visual>
+
+        <!-- Motors -->
+        <visual name="motor_fr">
+          <pose>0.22 -0.22 0.03 0 0 0</pose>
+          <geometry><cylinder><radius>0.035</radius><length>0.05</length></cylinder></geometry>
+          <material><diffuse>0.9 0.1 0.1 1</diffuse></material>
+        </visual>
+        <visual name="motor_fl">
+          <pose>0.22 0.22 0.03 0 0 0</pose>
+          <geometry><cylinder><radius>0.035</radius><length>0.05</length></cylinder></geometry>
+          <material><diffuse>0.1 0.9 0.1 1</diffuse></material>
+        </visual>
+        <visual name="motor_br">
+          <pose>-0.22 -0.22 0.03 0 0 0</pose>
+          <geometry><cylinder><radius>0.035</radius><length>0.05</length></cylinder></geometry>
+          <material><diffuse>0.1 0.1 0.9 1</diffuse></material>
+        </visual>
+        <visual name="motor_bl">
+          <pose>-0.22 0.22 0.03 0 0 0</pose>
+          <geometry><cylinder><radius>0.035</radius><length>0.05</length></cylinder></geometry>
+          <material><diffuse>0.9 0.9 0.1 1</diffuse></material>
+        </visual>
+
+        <!-- Propeller discs (semi-transparent) -->
+        <visual name="prop_fr">
+          <pose>0.22 -0.22 0.06 0 0 0</pose>
+          <geometry><cylinder><radius>0.13</radius><length>0.005</length></cylinder></geometry>
+          <material><diffuse>0.3 0.3 0.3 0.5</diffuse></material>
+        </visual>
+        <visual name="prop_fl">
+          <pose>0.22 0.22 0.06 0 0 0</pose>
+          <geometry><cylinder><radius>0.13</radius><length>0.005</length></cylinder></geometry>
+          <material><diffuse>0.3 0.3 0.3 0.5</diffuse></material>
+        </visual>
+        <visual name="prop_br">
+          <pose>-0.22 -0.22 0.06 0 0 0</pose>
+          <geometry><cylinder><radius>0.13</radius><length>0.005</length></cylinder></geometry>
+          <material><diffuse>0.3 0.3 0.3 0.5</diffuse></material>
+        </visual>
+        <visual name="prop_bl">
+          <pose>-0.22 0.22 0.06 0 0 0</pose>
+          <geometry><cylinder><radius>0.13</radius><length>0.005</length></cylinder></geometry>
+          <material><diffuse>0.3 0.3 0.3 0.5</diffuse></material>
+        </visual>
+
+        <!-- Landing gear -->
+        <visual name="gear_fl">
+          <pose>0.12 0.12 -0.1 0 0 0</pose>
+          <geometry><cylinder><radius>0.012</radius><length>0.15</length></cylinder></geometry>
+          <material><diffuse>0.15 0.15 0.15 1</diffuse></material>
+        </visual>
+        <visual name="gear_fr">
+          <pose>0.12 -0.12 -0.1 0 0 0</pose>
+          <geometry><cylinder><radius>0.012</radius><length>0.15</length></cylinder></geometry>
+          <material><diffuse>0.15 0.15 0.15 1</diffuse></material>
+        </visual>
+        <visual name="gear_bl">
+          <pose>-0.12 0.12 -0.1 0 0 0</pose>
+          <geometry><cylinder><radius>0.012</radius><length>0.15</length></cylinder></geometry>
+          <material><diffuse>0.15 0.15 0.15 1</diffuse></material>
+        </visual>
+        <visual name="gear_br">
+          <pose>-0.12 -0.12 -0.1 0 0 0</pose>
+          <geometry><cylinder><radius>0.012</radius><length>0.15</length></cylinder></geometry>
+          <material><diffuse>0.15 0.15 0.15 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Camera - view of helipad -->
+    <gui fullscreen='0'>
+      <camera name='user_camera'>
+        <pose>-20 -20 15 0 0.35 0.8</pose>
+        <view_controller>orbit</view_controller>
+      </camera>
+    </gui>
+
+  </world>
+</sdf>

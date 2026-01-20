@@ -281,7 +281,9 @@
 
     </link>
 
-    <!-- Controller plugin with optimal control -->
+    <!-- Note: Controller plugin disabled - use ArduPilot SITL for control -->
+    <!-- To enable: build quadrotor_controller_plugin and uncomment below -->
+    <!--
     <plugin name="quadrotor_controller" filename="libquadrotor_controller_plugin.so">
       <mass>2.0</mass>
       <target_model>ship</target_model>
@@ -292,6 +294,7 @@
       <kp_att>200.0</kp_att>
       <kd_att>30.0</kd_att>
     </plugin>
+    -->
 
   </model>
 </sdf>
