@@ -310,6 +310,55 @@ class ProcessManager:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
+        # Clean up any stale processes from previous runs
+        self._cleanup_stale_processes()
+
+    def _cleanup_stale_processes(self):
+        """Kill any stale simulation processes before starting"""
+        print("Cleaning up stale processes from previous runs...")
+
+        # Kill patterns for all simulation-related processes
+        kill_cmds = [
+            ['pkill', '-9', '-f', 'gz sim'],
+            ['pkill', '-9', '-f', 'gzserver'],
+            ['pkill', '-9', '-f', 'gzclient'],
+            ['pkill', '-9', '-f', 'arducopter'],
+            ['pkill', '-9', '-f', 'sim_vehicle'],
+            ['pkill', '-9', '-f', 'mavproxy'],
+            ['killall', '-9', 'ruby'],  # sim_vehicle spawns ruby
+            ['killall', '-9', 'gz'],
+        ]
+
+        for cmd in kill_cmds:
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=5)
+            except:
+                pass
+
+        # Wait for ports to be released
+        print("  Waiting for ports to release...")
+        time.sleep(3)
+
+        # Verify port 5760 is free
+        import socket
+        for i in range(10):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                result = sock.connect_ex(('127.0.0.1', 5760))
+                sock.close()
+                if result != 0:  # Port is free (connection refused)
+                    print("  Port 5760 is free - ready to start")
+                    return
+                else:
+                    print(f"  Port 5760 still in use, waiting... ({i+1}/10)")
+                    time.sleep(1)
+            except:
+                print("  Port 5760 is free - ready to start")
+                return
+
+        print("  WARNING: Port 5760 may still be in use")
+
     def _signal_handler(self, signum, frame):
         """Handle interrupt signals"""
         print("\nReceived interrupt signal, cleaning up...")
