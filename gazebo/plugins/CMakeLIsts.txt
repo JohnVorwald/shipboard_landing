@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.10.2)
+project(gazebo_plugins)
+
+# Find Gazebo Sim and all its components (like gz-plugin, gz-math)
+find_package(gz-sim9 REQUIRED)
+
+# Add the necessary include directories for all gz-* libraries to the build
+include_directories(${GZ_SIM9_INCLUDE_DIRS})
+
+# --- Ship Motion Plugin ---
+add_library(ship_motion_plugin SHARED ship_motion_plugin.cc)
+# Link the plugin against the Gazebo libraries
+target_link_libraries(ship_motion_plugin PRIVATE ${GZ_SIM9_LIBRARIES})
+
+# --- Quadrotor Controller Plugin ---
+add_library(quadrotor_controller_plugin SHARED quadrotor_controller_plugin.cc)
+# Link the plugin against the Gazebo libraries
+target_link_libraries(quadrotor_controller_plugin PRIVATE ${GZ_SIM9_LIBRARIES})

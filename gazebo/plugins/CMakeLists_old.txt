@@ -1,0 +1,26 @@
+cmake_minimum_required(VERSION 3.10)
+project(shipboard_landing_gazebo_plugins)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Find Gazebo
+# find_package(gazebo REQUIRED)
+find_package(gz-sim9 REQUIRED)
+# include_directories(${GAZEBO_INCLUDE_DIRS})
+include_directories(${GZ-SIM9_INCLUDE_DIRS})
+# link_directories(${GAZEBO_LIBRARY_DIRS})
+link_directories(${GZ-SIM9_LIBRARY_DIRS})
+list(APPEND CMAKE_CXX_FLAGS "${GAZEBO_CXX_FLAGS}")
+
+# Ship Motion Plugin
+add_library(ship_motion_plugin SHARED ship_motion_plugin.cc)
+target_link_libraries(ship_motion_plugin ${GAZEBO_LIBRARIES})
+
+# Quadrotor Controller Plugin with optimal control interface
+add_library(quadrotor_controller_plugin SHARED quadrotor_controller_plugin.cc)
+target_link_libraries(quadrotor_controller_plugin ${GAZEBO_LIBRARIES})
+
+# Install
+install(TARGETS ship_motion_plugin quadrotor_controller_plugin
+        LIBRARY DESTINATION lib)
