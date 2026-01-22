@@ -13,6 +13,11 @@ Usage:
     python3 ship_landing_demo.py --headless   # No GUI (no screen recording)
 """
 
+import sys
+# Force unbuffered output for better debugging
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 import time
 import subprocess
 import threading
