@@ -412,28 +412,70 @@ class ProcessManager:
         # Wait for ArduPilot to initialize (needs time for build + startup + connect to Gazebo)
         print("Waiting for ArduPilot SITL to initialize...")
         print("  (ArduPilot may need to build, this can take 30+ seconds)")
+        print("  DEBUG: Monitoring ArduPilot output for 'JSON received' message")
 
-        # Wait for ArduPilot to open its TCP ports (5760, 5762)
+        # Wait for ArduPilot to open its TCP ports AND receive JSON from Gazebo
         import socket
-        for i in range(90):  # Wait up to 90 seconds for build + startup
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(1)
-                result = sock.connect_ex(('127.0.0.1', 5760))
-                sock.close()
-                if result == 0:
-                    print(f"  ArduPilot TCP port 5760 ready after {i+1} seconds")
-                    time.sleep(3)  # Brief stabilization
-                    print("ArduPilot SITL started")
-                    return True
-                else:
-                    if i % 10 == 0:
-                        print(f"  Waiting for ArduPilot... ({i}/90)")
-                    time.sleep(1)
-            except:
-                time.sleep(1)
+        port_ready = False
+        json_ready = False
 
-        print("  WARNING: ArduPilot ports not detected after 90 seconds")
+        for i in range(120):  # Wait up to 120 seconds
+            # Check TCP port
+            if not port_ready:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(1)
+                    result = sock.connect_ex(('127.0.0.1', 5760))
+                    sock.close()
+                    if result == 0:
+                        print(f"  DEBUG: TCP port 5760 ready at {i+1}s")
+                        port_ready = True
+                except:
+                    pass
+
+            # Check ArduPilot output for JSON connection
+            if port_ready and self.ardupilot_process:
+                try:
+                    # Read any available output
+                    import select
+                    if hasattr(self.ardupilot_process, 'stdout') and self.ardupilot_process.stdout:
+                        readable, _, _ = select.select([self.ardupilot_process.stdout], [], [], 0.1)
+                        if readable:
+                            line = self.ardupilot_process.stdout.readline()
+                            if line:
+                                line_str = line.decode('utf-8', errors='ignore').strip()
+                                if 'JSON' in line_str:
+                                    print(f"  DEBUG: {line_str}")
+                                if 'JSON received' in line_str:
+                                    json_ready = True
+                                    print(f"  DEBUG: JSON connection established at {i+1}s")
+                except:
+                    pass
+
+            # Both conditions met - give extra time for stabilization
+            if port_ready and json_ready:
+                print(f"  ArduPilot ready after {i+1} seconds (port + JSON)")
+                time.sleep(5)  # Extra stabilization for heartbeat
+                print("ArduPilot SITL started and connected to Gazebo")
+                return True
+
+            # Port ready but no JSON yet - still wait
+            if port_ready and i >= 30 and i % 10 == 0:
+                print(f"  DEBUG: Port ready, waiting for JSON sync... ({i}/120)")
+
+            if not port_ready and i % 15 == 0:
+                print(f"  Waiting for ArduPilot build/startup... ({i}/120)")
+
+            time.sleep(1)
+
+        # Timeout - return what we have
+        if port_ready:
+            print(f"  WARNING: Port ready but JSON sync not confirmed")
+            print(f"  Proceeding anyway - connection may fail")
+            time.sleep(5)
+            return True
+
+        print("  ERROR: ArduPilot ports not detected after 120 seconds")
         return False
 
     def cleanup(self):
@@ -715,36 +757,52 @@ class ShipLandingController:
         self.telemetry_thread = None
         self.running = False
 
-    def connect(self, timeout=90):
-        """Connect to ArduPilot via TCP port 5760"""
+    def connect(self, timeout=120):
+        """Connect to ArduPilot via TCP port 5760 with debugging"""
         print("Connecting to ArduPilot on tcp:127.0.0.1:5760...")
+        print("  DEBUG: Will retry with increasing delays until heartbeat received")
 
         start_time = time.time()
+        attempt = 0
 
         while time.time() - start_time < timeout:
+            attempt += 1
+            elapsed = int(time.time() - start_time)
+
             try:
+                print(f"  DEBUG: Connection attempt {attempt} at {elapsed}s...")
                 self.master = mavutil.mavlink_connection('tcp:127.0.0.1:5760', source_system=255)
 
-                # Wait for heartbeat
-                msg = self.master.wait_heartbeat(timeout=10)
-                if msg and self.master.target_system == 1:
-                    print(f"Connected to system {self.master.target_system}")
+                # Wait for heartbeat with longer timeout
+                print(f"  DEBUG: Waiting for heartbeat (15s timeout)...")
+                msg = self.master.wait_heartbeat(timeout=15)
 
-                    # Start telemetry thread
-                    self.running = True
-                    self.telemetry_thread = threading.Thread(target=self._telemetry_loop)
-                    self.telemetry_thread.daemon = True
-                    self.telemetry_thread.start()
+                if msg:
+                    print(f"  DEBUG: Got heartbeat from system {self.master.target_system}")
+                    if self.master.target_system == 1:
+                        print(f"Connected to ArduPilot system 1 (attempt {attempt}, {elapsed}s)")
 
-                    return True
+                        # Start telemetry thread
+                        self.running = True
+                        self.telemetry_thread = threading.Thread(target=self._telemetry_loop)
+                        self.telemetry_thread.daemon = True
+                        self.telemetry_thread.start()
+
+                        return True
+                    else:
+                        print(f"  DEBUG: Wrong system ({self.master.target_system}), retrying...")
                 else:
-                    print(f"  Got system {self.master.target_system if msg else 'none'}, retrying...")
+                    print(f"  DEBUG: No heartbeat received (attempt {attempt})")
 
             except Exception as e:
-                print(f"  Connection error: {e}, retrying...")
-                time.sleep(3)
+                print(f"  DEBUG: Connection error at {elapsed}s: {e}")
 
-        print("Failed to connect within timeout")
+            # Increasing delay between attempts
+            delay = min(5, 2 + attempt // 3)
+            print(f"  DEBUG: Waiting {delay}s before next attempt...")
+            time.sleep(delay)
+
+        print(f"Failed to connect after {attempt} attempts ({timeout}s timeout)")
         return False
 
     def _telemetry_loop(self):
