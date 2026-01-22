@@ -1,120 +1,111 @@
 # Ship Landing Project - Session Summary
 
-**Date:** January 16, 2026
-**Status:** Gazebo visualization working, mission running with ArduPilot SITL
+**Date:** January 22, 2026
+**Status:** ArduPilot + Gazebo integration WORKING with manual commands
 
-## Work Completed
+---
 
-### 1. ArduPilot Arm/Takeoff Fixes
-- Updated `simulation/ship_landing_mission.py` with reliable arming:
-  - Uses `arducopter_arm()` and `motors_armed_wait()` from pymavlink
-  - Added force-arm fallback with `ARMING_CHECK=0` and magic number `21196`
-  - Better takeoff monitoring with ACK check
+## Current Session Progress
 
-### 2. Ship Position Tracking Fix
-- Fixed `ShipState.update()` method - was accumulating position incorrectly
-- Now correctly computes: `_current_position = initial_position + velocity * elapsed_time`
-- Added `__post_init__` to initialize `_current_position` from `initial_position`
+### What's Working
 
-### 3. Waypoint Controller Tuning
-- Increased gain: 2 -> 4 (more aggressive pursuit)
-- Increased max_speed: 8 -> 10 m/s
-- Added minimum pursuit speed of 2 m/s to catch moving ship
+1. **Gazebo + ArduPilot Connection** - CONFIRMED WORKING
+   - Gazebo Harmonic v8.10.0 with ship world and iris_with_gimbal
+   - ArduPilot SITL connects via JSON interface
+   - EKF initializes and becomes healthy
+   - Arming works (with force arm)
+   - Takeoff and landing work
 
-### 4. Gazebo Visualization Fixes
-The main challenge was getting Gazebo GUI to work. Key fixes:
+2. **Manual Flight Test** - SUCCESS
+   ```python
+   # Connected to tcp:127.0.0.1:5760
+   # Armed on attempt 3
+   # Took off to 10m
+   # Landed
+   ```
 
-**Environment Variables (CRITICAL):**
+3. **Environment Variables** - RESOLVED
+   - Must prepend custom paths to existing GZ_SIM_RESOURCE_PATH
+   - Direct subprocess.Popen with env dict works reliably
+   - gnome-terminal approach doesn't pass env vars correctly
+
+### Working Launch Commands
+
+**Terminal 1 - Gazebo:**
 ```bash
-export DISPLAY=:10.0  # Your display
-export GZ_IP=127.0.0.1
-export GZ_PARTITION=gazebo_default
-export LIBGL_DRI3_DISABLE=1  # NVIDIA hybrid graphics fix
-export QT_QPA_PLATFORM=xcb
-export GZ_SIM_PHYSICS_ENGINE_PATH="/usr/lib/x86_64-linux-gnu/gz-physics-8/engine-plugins"
-```
-
-**Physics Stability Fixes:**
-- Changed from `graded_buoyancy` to `uniform_fluid_density` (simpler, more stable)
-- Removed `gz-sim-hydrodynamics-system` plugin (was causing DART NaN crashes)
-- Reduced ship mass from 4,000,000 kg to 500,000 kg
-
-**Working command:**
-```bash
-gz sim -r --render-engine ogre worlds/ship_simple.world
-```
-
-### 5. Files Modified
-
-| File | Changes |
-|------|---------|
-| `simulation/ship_landing_mission.py` | Arm/takeoff fixes, ship tracking, waypoint controller |
-| `simulation/record_mission.sh` | Video recording script with proper env vars |
-| `gazebo/worlds/ship_simple.world` | Fixed physics, removed hydrodynamics, camera position |
-
-## Current State
-
-### Working:
-- Gazebo GUI displays ship, water plane, and quadcopter
-- Simulation runs without crashing (physics stable)
-- ArduPilot SITL connects and arms reliably
-- Mission flies quad to helipad on stationary ship
-- Moving ship tracking works in headless mode
-
-### Recording Script Location:
-```
-/home/john/github/shipboard_landing/simulation/record_mission.sh
-```
-
-### To Run:
-```bash
-cd /home/john/github/shipboard_landing/simulation
-./record_mission.sh output.mp4
-```
-
-## Next Steps (After Weekend)
-
-1. **Test full mission with video recording** - verify quad lands on helipad in visualization
-2. **Add moving ship support to Gazebo** - currently ship is static in visualization
-3. **Tune landing controller** - may need adjustment based on visual feedback
-4. **Record demo video** - capture successful landing for documentation
-
-## Known Issues
-
-1. **Gazebo window not appearing** - Process runs but window doesn't show. Need to figure out correct DISPLAY setting for your session. Try running directly from your terminal.
-2. **OGRE shader warnings** - "Unable to find shader lib" - shadows disabled but simulation works
-3. **Ship motion not in Gazebo** - ship is static in visualization; motion only tracked internally
-4. **Buoyancy oscillation** - ship may bounce slightly at start; settles after a few seconds
-
-## Display Issue - TO FIX
-
-The Gazebo window isn't appearing. When you return, try running this directly from YOUR terminal:
-
-```bash
-cd /home/john/github/shipboard_landing/gazebo
+export GZ_SIM_RESOURCE_PATH=/home/john/gz_ws/src/ardupilot_gazebo/models:/home/john/gz_ws/src/ardupilot_gazebo/worlds:/home/john/github/shipboard_landing/gazebo/models
+export GZ_SIM_SYSTEM_PLUGIN_PATH=/home/john/gz_ws/src/ardupilot_gazebo/build
+export DISPLAY=:10  # or :0 for local
 export GZ_IP=127.0.0.1 GZ_PARTITION=gazebo_default LIBGL_DRI3_DISABLE=1 QT_QPA_PLATFORM=xcb
-gz sim --render-engine ogre worlds/ship_simple.world
+gz sim -r /home/john/github/shipboard_landing/gazebo/worlds/ship_landing_ardupilot.sdf
 ```
 
-If it still doesn't appear, check your DISPLAY variable with `echo $DISPLAY` and use that value.
-
-## Quick Test Commands
-
-**Test Gazebo alone:**
+**Terminal 2 - ArduPilot (after Gazebo shows ship):**
 ```bash
-export DISPLAY=:10.0 GZ_IP=127.0.0.1 GZ_PARTITION=gazebo_default LIBGL_DRI3_DISABLE=1 QT_QPA_PLATFORM=xcb
-cd /home/john/github/shipboard_landing/gazebo
-gz sim -r --render-engine ogre worlds/ship_simple.world
+cd /home/john/ardupilot
+./Tools/autotest/sim_vehicle.py -v ArduCopter -f JSON --model JSON --no-mavproxy
 ```
 
-**Run mission without visualization:**
-```bash
-cd /home/john/github/shipboard_landing/simulation
-python3 ship_landing_mission.py --ship-speed 0
+**Python Connection:**
+```python
+from pymavlink import mavutil
+master = mavutil.mavlink_connection('tcp:127.0.0.1:5760', source_system=255)
+master.wait_heartbeat(timeout=15)  # Wait for system 1
+# Then: set_mode(4), arm, takeoff, etc.
 ```
 
-**Run mission with visualization:**
+### Automated Demo Script
+
+`simulation/ship_landing_demo.py` - Needs timing adjustment
+
+**Current Issue:**
+Script connects to ArduPilot before Gazebo-ArduPilot JSON connection is established.
+ArduPilot reports port 5760 open quickly, but heartbeat not available until
+JSON interface with Gazebo is working.
+
+**Fix Needed:**
+- Wait for ArduPilot to show "JSON received" in output before connecting
+- Or wait for heartbeat with longer timeout and more retries
+
+### Key Findings from Debugging
+
+1. **Port 9002 is NOT a TCP listener** - ArduPilotPlugin uses UDP for JSON
+2. **Heartbeat only available after Gazebo connection** - ArduPilot won't send
+   heartbeats until it receives JSON data from Gazebo
+3. **EKF may timeout without EKF_STATUS_REPORT** - Use longer waits
+4. **Force arm (21196) works** when normal arm fails due to checks
+
+### Files Modified
+
+| File | Status |
+|------|--------|
+| `simulation/ship_landing_demo.py` | Updated - needs timing fix |
+| `gazebo/launch_ship.sh` | Working launch script |
+| `STATUS.md` | Updated with commands |
+| `SESSION_SUMMARY.md` | This file |
+
+---
+
+## Next Steps
+
+1. **Fix automated demo timing** - Wait for ArduPilot-Gazebo sync before connect
+2. **Add verbose flight output** - Print arming attempts, altitude, position
+3. **Video recording** - Verify screen capture and telemetry overlay work
+4. **Ship motion** - Re-enable moving ship for landing tests
+
+## Quick Test
+
 ```bash
-cd /home/john/github/shipboard_landing/simulation
-./record_mission.sh test_video.mp4
+# Clean start
+pkill -9 -f 'gz sim'; pkill -9 -f arducopter; sleep 2
+
+# Launch Gazebo
+bash /home/john/github/shipboard_landing/gazebo/launch_ship.sh &
+sleep 15
+
+# Launch ArduPilot
+cd /home/john/ardupilot && ./Tools/autotest/sim_vehicle.py -v ArduCopter -f JSON --model JSON --no-mavproxy &
+sleep 30
+
+# Connect and fly (see STATUS.md for commands)
 ```

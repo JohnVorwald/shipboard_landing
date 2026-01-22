@@ -80,37 +80,102 @@ cd /home/john/ardupilot
 mode guided              # Enable position control
 arm throttle force       # Arm motors (force bypasses checks)
 takeoff 10               # Takeoff to 10m altitude
-mode land                # Land
+mode land                # Land at current position
 mode loiter              # Hold position
 disarm                   # Disarm motors
 ```
 
-### Position Control
-**Note: `position` command is RELATIVE to current position (NED frame)**
+### GUIDED Mode Flying
+
+#### Position Control (RELATIVE to current position)
+**IMPORTANT: `position` command moves RELATIVE to where you are now, NOT absolute!**
 ```bash
-position 10 0 0          # Move 10m North
-position 0 10 0          # Move 10m East
+position 10 0 0          # Move 10m North from current position
+position 0 10 0          # Move 10m East from current position
 position 0 0 -5          # Move 5m Up (Z negative = up in NED)
 position 0 0 5           # Move 5m Down
 position -10 -10 0       # Move 10m South and 10m West
 ```
 
-### Show Current Position
+#### Return to Home/Helipad
+```bash
+# Option 1: RTL mode (automatic return and land)
+mode rtl                 # Return to launch point, then land
+
+# Option 2: Manual return using LOCAL_POSITION_NED
+# First check your position relative to home:
+status LOCAL_POSITION_NED
+# Shows: x (North), y (East), z (Down, negative=up)
+# To return to home at current altitude:
+# If you're at x=20, y=30, z=-10: use position -20 -30 0
+
+# Option 3: Land mode at current position
+mode land                # Land where you are
+```
+
+#### Show Position Relative to Home
+```bash
+# LOCAL_POSITION_NED shows position relative to home/launch point
+status LOCAL_POSITION_NED
+# Output example:
+#   LOCAL_POSITION_NED {x: 15.2, y: -3.4, z: -10.5, vx: 0.1, vy: 0.0, vz: 0.0}
+#   x = 15.2m North of home
+#   y = -3.4m East of home (negative = West)
+#   z = -10.5m Down (negative = 10.5m UP/altitude)
+
+# Continuous monitoring:
+watch LOCAL_POSITION_NED
+nowatch LOCAL_POSITION_NED   # Stop watching
+```
+
+#### Show GPS Position
 ```bash
 status GLOBAL_POSITION_INT    # Show lat/lon/alt
-status LOCAL_POSITION_NED     # Show x/y/z in meters
-status                        # Show all telemetry
-watch GLOBAL_POSITION_INT     # Continuous position updates
-nowatch GLOBAL_POSITION_INT   # Stop watching
+# Output includes:
+#   lat, lon: GPS coordinates (divide by 1e7 for degrees)
+#   alt: MSL altitude in mm
+#   relative_alt: Altitude above home in mm
+
+watch GLOBAL_POSITION_INT     # Continuous GPS updates
+```
+
+#### Altitude Control
+```bash
+# In GUIDED mode, altitude is the negative Z component
+position 0 0 -15         # Go up to 15m altitude (relative move)
+position 0 0 -5          # Go up 5m from current altitude
+position 0 0 5           # Go down 5m from current altitude
+
+# To go to specific altitude, calculate from current:
+# If at z=-10 (10m alt) and want 20m: position 0 0 -10
+```
+
+#### Example Flight Sequence
+```bash
+mode guided              # Enable GUIDED mode
+arm throttle force       # Arm with force (bypasses pre-arm checks)
+takeoff 10               # Takeoff to 10m
+
+# Fly a square pattern (each move is RELATIVE)
+position 10 0 0          # 10m North
+position 0 10 0          # 10m East (now at N=10, E=10)
+position -10 0 0         # 10m South (now at N=0, E=10)
+position 0 -10 0         # 10m West (back to N=0, E=0 = home)
+
+mode land                # Land
+# or
+mode rtl                 # Return to launch and land
 ```
 
 ### Other Useful Commands
 ```bash
 mode stabilize           # Manual control mode
+mode loiter              # Hold current position
 mode rtl                 # Return to launch
 param show FRAME_CLASS   # Show parameter
 param set FRAME_CLASS 1  # Set parameter
 arm list                 # Show arm checks
+status                   # Show all telemetry
 ```
 
 ---
